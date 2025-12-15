@@ -37,6 +37,7 @@ async def lifespan(app: FastAPI):
     # 初始化配置缓存（优先执行）
     try:
         import config
+
         await config.init_config()
         log.info("配置缓存初始化成功")
     except Exception as e:
@@ -168,6 +169,10 @@ async def main():
     config.startup_timeout = 120  # 2分钟启动超时
 
     await serve(app, config)
+
+
+def run():
+    asyncio.run(main())
 
 
 if __name__ == "__main__":

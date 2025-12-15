@@ -101,3 +101,31 @@ exclude_lines = [
     "if __name__ == .__main__.:",
     "if TYPE_CHECKING:",
 ]
+
+[project.scripts]
+gcli2api = "web:run"
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*", "config", "log", "web.py"]
+[tool.setuptools.package-data]
+"*" = ["front/**/*"]
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+[tool.hatch.build]
+exclude = [
+  "tests",
+  ".git",
+  ".github",
+  "/ui",
+  ".vscode",
+  ".idea",
+  ".pytest_cache",
+  "__pycache__",
+]
+[tool.hatch.build.force-include]
+"web.py" = "web.py"
+"config.py" = "config.py"
+"log.py" = "log.py"
+"src" = "src"
+"front" = "front"
