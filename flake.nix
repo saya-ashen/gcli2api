@@ -25,6 +25,22 @@
     in
       python.pkgs.buildPythonPackage (attrs
         // {
+          postInstall = ''
+            ${attrs.postInstall or ""}
+            mkdir -p $out/share/gcli2api/docs
+            mkdir -p $out/share/gcli2api/front
+            cp -r docs/* $out/share/gcli2api/docs/
+            cp -r front/* $out/share/gcli2api/front/
+
+            BINARY="$out/bin/gcli2api"
+
+            if [ -f "$BINARY" ]; then
+              wrapProgram "$BINARY" \
+                --run "echo 'Initializing assets...'; cp -rn $out/share/gcli2api/* . || true"
+            else
+              echo "Warning: Binary $BINARY not found, skipping wrapper."
+            fi
+          '';
         });
     devShells.${system} = let
       pkgs = import inputs.nixpkgs {

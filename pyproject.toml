@@ -128,4 +128,3 @@ exclude = [
 "config.py" = "config.py"
 "log.py" = "log.py"
 "src" = "src"
-"front" = "front"
