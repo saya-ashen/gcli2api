@@ -22,7 +22,6 @@ from config import (
 )
 from src.utils import (
     DEFAULT_SAFETY_SETTINGS,
-    PUBLIC_API_MODELS,
     get_base_model_name,
     get_thinking_budget,
     is_search_model,
@@ -151,7 +150,7 @@ async def _handle_error_with_retry(
 
 
 async def _prepare_request_headers_and_payload(
-    payload: dict, credential_data: dict, use_public_api: bool, target_url: str
+    payload: dict, credential_data: dict, target_url: str
 ):
     """Prepare request headers and final payload from credential data."""
     token = credential_data.get("token") or credential_data.get("access_token", "")
@@ -159,10 +158,6 @@ async def _prepare_request_headers_and_payload(
         raise Exception("凭证中没有找到有效的访问令牌（token或access_token字段）")
 
     source_request = payload.get("request", {})
-    if use_public_api:
-        if "generationConfig" in source_request:
-            imageConfig = source_request["generationConfig"].get("imageConfig")
-            source_request["generationConfig"] = {"imageConfig": imageConfig} if imageConfig else {}
 
     # 内部API使用Bearer Token和项目ID
     headers = {
@@ -204,7 +199,6 @@ async def send_gemini_request(
     # 动态确定API端点和payload格式
     model_name = payload.get("model", "")
     base_model_name = get_base_model_name(model_name)
-    use_public_api = base_model_name in PUBLIC_API_MODELS
     action = "streamGenerateContent" if is_streaming else "generateContent"
     target_url = f"{await get_code_assist_endpoint()}/v1internal:{action}"
     if is_streaming:
@@ -228,7 +222,7 @@ async def send_gemini_request(
 
             current_file, credential_data = credential_result
             headers, final_payload, target_url = await _prepare_request_headers_and_payload(
-                payload, credential_data, use_public_api, target_url
+                payload, credential_data, target_url
             )
             # 预序列化payload
             final_post_data = json.dumps(final_payload)
@@ -237,9 +231,13 @@ async def send_gemini_request(
         try:
             if is_streaming:
                 # 流式请求处理 - 使用httpx_client模块的统一配置
-                client = await create_streaming_client_with_kwargs()
+                client = None
+                stream_ctx = None
+                resp = None
 
                 try:
+                    client = await create_streaming_client_with_kwargs()
+
                     # 使用stream方法但不在async with块中消费数据
                     stream_ctx = client.stream(
                         "POST", target_url, content=final_post_data, headers=headers
@@ -282,12 +280,18 @@ async def send_gemini_request(
                                 current_file, False, resp.status_code, cooldown_until, model_key=model_group
                             )
 
-                        # 清理资源
+                        # 清理资源 - 确保按正确顺序清理
                         try:
-                            await stream_ctx.__aexit__(None, None, None)
-                        except Exception:
-                            pass
-                        await client.aclose()
+                            if stream_ctx:
+                                await stream_ctx.__aexit__(None, None, None)
+                        except Exception as cleanup_err:
+                            log.debug(f"Error cleaning up stream_ctx: {cleanup_err}")
+                        finally:
+                            try:
+                                if client:
+                                    await client.aclose()
+                            except Exception as cleanup_err:
+                                log.debug(f"Error closing client: {cleanup_err}")
 
                         # 使用统一的错误处理和重试逻辑
                         should_retry = await _handle_error_with_retry(
@@ -337,11 +341,18 @@ async def send_gemini_request(
                         )
 
                 except Exception as e:
-                    # 清理资源
+                    # 清理资源 - 确保按正确顺序清理
                     try:
-                        await client.aclose()
-                    except Exception:
-                        pass
+                        if stream_ctx:
+                            await stream_ctx.__aexit__(None, None, None)
+                    except Exception as cleanup_err:
+                        log.debug(f"Error cleaning up stream_ctx in exception handler: {cleanup_err}")
+                    finally:
+                        try:
+                            if client:
+                                await client.aclose()
+                        except Exception as cleanup_err:
+                            log.debug(f"Error closing client in exception handler: {cleanup_err}")
                     raise e
 
             else:
@@ -352,7 +363,7 @@ async def send_gemini_request(
                     # === 修改：统一处理所有非200状态码，沿用429行为 ===
                     if resp.status_code == 200:
                         return await _handle_non_streaming_response(
-                            resp, credential_manager, payload.get("model", ""), current_file, model_group
+                            resp, credential_manager, current_file, model_group
                         )
 
                     # 记录错误
@@ -436,14 +447,18 @@ def _handle_streaming_response_managed(
     if resp.status_code != 200:
         # 立即清理资源并返回错误
         async def cleanup_and_error():
+            # 清理资源 - 按正确顺序：先关闭stream，再关闭client
             try:
-                await stream_ctx.__aexit__(None, None, None)
-            except Exception:
-                pass
-            try:
-                await client.aclose()
-            except Exception:
-                pass
+                if stream_ctx:
+                    await stream_ctx.__aexit__(None, None, None)
+            except Exception as cleanup_err:
+                log.debug(f"Error cleaning up stream_ctx: {cleanup_err}")
+            finally:
+                try:
+                    if client:
+                        await client.aclose()
+                except Exception as cleanup_err:
+                    log.debug(f"Error closing client: {cleanup_err}")
 
             # 获取响应内容用于详细错误显示
             response_content = ""
@@ -510,7 +525,8 @@ def _handle_streaming_response_managed(
     # 正常流式响应处理，确保资源在流结束时被清理
     async def managed_stream_generator():
         success_recorded = False
-        managed_stream_generator._chunk_count = 0  # 初始化chunk计数器
+        chunk_count = 0  # 使用局部变量代替函数属性
+        bytes_transferred = 0  # 跟踪传输的字节数
         return_thoughts = await get_return_thoughts_to_frontend()  # 获取配置
         try:
             async for chunk in resp.aiter_lines():
@@ -533,14 +549,18 @@ def _handle_streaming_response_managed(
                         # 如果配置为不返回思维链，则过滤
                         if not return_thoughts:
                             data = _filter_thoughts_from_response(data)
-                        yield f"data: {json.dumps(data, separators=(',', ':'))}\n\n".encode()
+                        chunk_data = f"data: {json.dumps(data, separators=(',', ':'))}\n\n".encode()
+                        yield chunk_data
                         await asyncio.sleep(0)  # 让其他协程有机会运行
 
-                        # 定期释放内存（每100个chunk）
-                        if hasattr(managed_stream_generator, "_chunk_count"):
-                            managed_stream_generator._chunk_count += 1
-                            if managed_stream_generator._chunk_count % 100 == 0:
-                                gc.collect()
+                        # 基于传输字节数触发GC，而不是chunk数量
+                        # 每传输约10MB数据时触发一次GC
+                        chunk_count += 1
+                        bytes_transferred += len(chunk_data)
+                        if bytes_transferred > 10 * 1024 * 1024:  # 10MB
+                            gc.collect()
+                            bytes_transferred = 0
+                            log.debug(f"Triggered GC after {chunk_count} chunks (~10MB transferred)")
                     else:
                         yield f"data: {json.dumps(obj, separators=(',', ':'))}\n\n".encode()
                 except json.JSONDecodeError:
@@ -551,15 +571,18 @@ def _handle_streaming_response_managed(
             err = {"error": {"message": str(e), "type": "api_error", "code": 500}}
             yield f"data: {json.dumps(err)}\n\n".encode()
         finally:
-            # 确保清理所有资源
+            # 确保清理所有资源 - 按正确顺序：先关闭stream，再关闭client
             try:
-                await stream_ctx.__aexit__(None, None, None)
+                if stream_ctx:
+                    await stream_ctx.__aexit__(None, None, None)
             except Exception as e:
                 log.debug(f"Error closing stream context: {e}")
-            try:
-                await client.aclose()
-            except Exception as e:
-                log.debug(f"Error closing client: {e}")
+            finally:
+                try:
+                    if client:
+                        await client.aclose()
+                except Exception as e:
+                    log.debug(f"Error closing client: {e}")
 
     return StreamingResponse(managed_stream_generator(), media_type="text/event-stream")
 
@@ -567,7 +590,6 @@ def _handle_streaming_response_managed(
 async def _handle_non_streaming_response(
     resp,
     credential_manager: CredentialManager = None,
-    model_name: str = "",
     current_file: str = None,
     model_group: str = None,
 ) -> Response:

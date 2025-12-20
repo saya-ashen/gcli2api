@@ -56,19 +56,21 @@ function createCredsManager(type) {
         selectedFiles: new Set(),
         totalCount: 0,
         currentStatusFilter: 'all',
+        currentErrorCodeFilter: 'all',
+        currentCooldownFilter: 'all',
         statsData: { total: 0, normal: 0, disabled: 0 },
 
         // API端点
         getEndpoint: (action) => {
             const endpoints = {
-                status: `${apiPrefix}/creds/status`,
-                action: `${apiPrefix}/creds/action`,
-                batchAction: `${apiPrefix}/creds/batch-action`,
-                download: `${apiPrefix}/creds/download`,
-                downloadAll: `${apiPrefix}/creds/download-all`,
-                detail: `${apiPrefix}/creds/detail`,
-                fetchEmail: `${apiPrefix}/creds/fetch-email`,
-                refreshAllEmails: `${apiPrefix}/creds/refresh-all-emails`
+                status: `.${apiPrefix}/creds/status`,
+                action: `.${apiPrefix}/creds/action`,
+                batchAction: `.${apiPrefix}/creds/batch-action`,
+                download: `.${apiPrefix}/creds/download`,
+                downloadAll: `.${apiPrefix}/creds/download-all`,
+                detail: `.${apiPrefix}/creds/detail`,
+                fetchEmail: `.${apiPrefix}/creds/fetch-email`,
+                refreshAllEmails: `.${apiPrefix}/creds/refresh-all-emails`
             };
             return endpoints[action] || '';
         },
@@ -93,8 +95,10 @@ function createCredsManager(type) {
                 list.innerHTML = '';
 
                 const offset = (this.currentPage - 1) * this.pageSize;
+                const errorCodeFilter = this.currentErrorCodeFilter || 'all';
+                const cooldownFilter = this.currentCooldownFilter || 'all';
                 const response = await fetch(
-                    `${this.getEndpoint('status')}?offset=${offset}&limit=${this.pageSize}&status_filter=${this.currentStatusFilter}`,
+                    `${this.getEndpoint('status')}?offset=${offset}&limit=${this.pageSize}&status_filter=${this.currentStatusFilter}&error_code_filter=${errorCodeFilter}&cooldown_filter=${cooldownFilter}`,
                     { headers: getAuthHeaders() }
                 );
 
@@ -111,15 +115,18 @@ function createCredsManager(type) {
                                 last_success: item.last_success,
                             },
                             user_email: item.user_email,
-                            cooldown_status: item.cooldown_status,
-                            cooldown_remaining_seconds: item.cooldown_remaining_seconds,
-                            cooldown_until: item.cooldown_until,
                             model_cooldowns: item.model_cooldowns || {}
                         };
                     });
 
                     this.totalCount = data.total;
-                    this.calculateStats();
+                    // 使用后端返回的全局统计数据
+                    if (data.stats) {
+                        this.statsData = data.stats;
+                    } else {
+                        // 兼容旧版本后端
+                        this.calculateStats();
+                    }
                     this.updateStatsDisplay();
                     this.filteredData = this.data;
                     this.renderList();
@@ -140,7 +147,7 @@ function createCredsManager(type) {
             }
         },
 
-        // 计算统计数据
+        // 计算统计数据（仅用于兼容旧版本后端）
         calculateStats() {
             this.statsData = { total: this.totalCount, normal: 0, disabled: 0 };
             Object.values(this.data).forEach(credInfo => {
@@ -219,6 +226,10 @@ function createCredsManager(type) {
         // 应用状态筛选
         applyStatusFilter() {
             this.currentStatusFilter = document.getElementById(this.getElementId('StatusFilter')).value;
+            const errorCodeFilterEl = document.getElementById(this.getElementId('ErrorCodeFilter'));
+            const cooldownFilterEl = document.getElementById(this.getElementId('CooldownFilter'));
+            this.currentErrorCodeFilter = errorCodeFilterEl ? errorCodeFilterEl.value : 'all';
+            this.currentCooldownFilter = cooldownFilterEl ? cooldownFilterEl.value : 'all';
             this.currentPage = 1;
             this.refresh();
         },
@@ -228,7 +239,7 @@ function createCredsManager(type) {
             const selectedCount = this.selectedFiles.size;
             document.getElementById(this.getElementId('SelectedCount')).textContent = `已选择 ${selectedCount} 项`;
 
-            const batchBtns = ['Enable', 'Disable', 'Delete'].map(action =>
+            const batchBtns = ['Enable', 'Disable', 'Delete', 'Verify'].map(action =>
                 document.getElementById(this.getElementId(`Batch${action}Btn`))
             );
             batchBtns.forEach(btn => btn && (btn.disabled = selectedCount === 0));
@@ -325,7 +336,7 @@ function createCredsManager(type) {
 // =====================================================================
 function createUploadManager(type) {
     const isAntigravity = type === 'antigravity';
-    const endpoint = isAntigravity ? '/antigravity/upload' : '/auth/upload';
+    const endpoint = isAntigravity ? './antigravity/upload' : './auth/upload';
 
     return {
         type: type,
@@ -347,7 +358,7 @@ function createUploadManager(type) {
         addFiles(files) {
             files.forEach(file => {
                 const isValid = file.type === 'application/json' || file.name.endsWith('.json') ||
-                               file.type === 'application/zip' || file.name.endsWith('.zip');
+                    file.type === 'application/zip' || file.name.endsWith('.zip');
 
                 if (isValid) {
                     if (!this.selectedFiles.find(f => f.name === file.name && f.size === file.size)) {
@@ -482,7 +493,26 @@ function createUploadManager(type) {
 function showStatus(message, type = 'info') {
     const statusSection = document.getElementById('statusSection');
     if (statusSection) {
+        // 清除之前的定时器
+        if (window._statusTimeout) {
+            clearTimeout(window._statusTimeout);
+        }
+
+        // 创建新的 toast
         statusSection.innerHTML = `<div class="status ${type}">${message}</div>`;
+        const statusDiv = statusSection.querySelector('.status');
+
+        // 强制重绘以触发动画
+        statusDiv.offsetHeight;
+        statusDiv.classList.add('show');
+
+        // 3秒后淡出并移除
+        window._statusTimeout = setTimeout(() => {
+            statusDiv.classList.add('fade-out');
+            setTimeout(() => {
+                statusSection.innerHTML = '';
+            }, 300); // 等待淡出动画完成
+        }, 3000);
     } else {
         alert(message);
     }
@@ -538,13 +568,6 @@ function createCredCard(credInfo, manager) {
         statusBadges += '<span class="status-badge" style="background-color: #28a745; color: white;">无错误</span>';
     }
 
-    // 全局冷却状态
-    if (credInfo.cooldown_status === 'cooling' && credInfo.cooldown_remaining_seconds) {
-        const timeDisplay = formatCooldownTime(credInfo.cooldown_remaining_seconds);
-        const cooldownTime = new Date(credInfo.cooldown_until * 1000).toLocaleString('zh-CN');
-        statusBadges += `<span class="cooldown-badge" title="冷却截止时间: ${cooldownTime}">🕐 全局冷却: ${timeDisplay}</span>`;
-    }
-
     // 模型级冷却状态
     if (credInfo.model_cooldowns && Object.keys(credInfo.model_cooldowns).length > 0) {
         const currentTime = Date.now() / 1000;
@@ -585,6 +608,8 @@ function createCredCard(credInfo, manager) {
         <button class="cred-btn view" onclick="toggle${isAntigravity ? 'Antigravity' : ''}CredDetails('${pathId}')">查看内容</button>
         <button class="cred-btn download" onclick="download${isAntigravity ? 'Antigravity' : ''}Cred('${filename}')">下载</button>
         <button class="cred-btn email" onclick="fetch${isAntigravity ? 'Antigravity' : ''}UserEmail('${filename}')">查看账号邮箱</button>
+        ${isAntigravity ? `<button class="cred-btn" style="background-color: #17a2b8;" onclick="toggleAntigravityQuotaDetails('${pathId}')" title="查看该凭证的额度信息">查看额度</button>` : ''}
+        <button class="cred-btn" style="background-color: #ff9800;" onclick="verify${isAntigravity ? 'Antigravity' : ''}ProjectId('${filename}')" title="重新获取Project ID，可恢复403错误">检验</button>
         <button class="cred-btn delete" data-filename="${filename}" data-action="delete">删除</button>
     `;
 
@@ -610,11 +635,18 @@ function createCredCard(credInfo, manager) {
         <div class="cred-details" id="details-${pathId}">
             <div class="cred-content" data-filename="${filename}" data-loaded="false">点击"查看内容"按钮加载文件详情...</div>
         </div>
+        ${isAntigravity ? `
+        <div class="cred-quota-details" id="quota-${pathId}" style="display: none;">
+            <div class="cred-quota-content" data-filename="${filename}" data-loaded="false">
+                点击"查看额度"按钮加载额度信息...
+            </div>
+        </div>
+        ` : ''}
     `;
 
     // 添加事件监听
     div.querySelectorAll('[data-filename][data-action]').forEach(button => {
-        button.addEventListener('click', function() {
+        button.addEventListener('click', function () {
             const fn = this.getAttribute('data-filename');
             const action = this.getAttribute('data-action');
             if (action === 'delete') {
@@ -657,8 +689,8 @@ async function toggleCredDetailsCommon(pathId, manager) {
 
             try {
                 const endpoint = manager.type === 'antigravity'
-                    ? `/antigravity/creds/download/${encodeURIComponent(filename)}`
-                    : `/creds/detail/${encodeURIComponent(filename)}`;
+                    ? `./antigravity/creds/download/${encodeURIComponent(filename)}`
+                    : `./creds/detail/${encodeURIComponent(filename)}`;
 
                 const response = await fetch(endpoint, { headers: getAuthHeaders() });
 
@@ -698,7 +730,7 @@ async function login() {
     }
 
     try {
-        const response = await fetch('/auth/login', {
+        const response = await fetch('./auth/login', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ password })
@@ -712,6 +744,8 @@ async function login() {
             document.getElementById('loginSection').classList.add('hidden');
             document.getElementById('mainSection').classList.remove('hidden');
             showStatus('登录成功', 'success');
+            // 显示面板后初始化滑块
+            requestAnimationFrame(() => initTabSlider());
         } else {
             showStatus(`登录失败: ${data.detail || data.error || '未知错误'}`, 'error');
         }
@@ -727,7 +761,7 @@ async function autoLogin() {
     AppState.authToken = savedToken;
 
     try {
-        const response = await fetch('/config/get', {
+        const response = await fetch('./config/get', {
             headers: {
                 'Content-Type': 'application/json',
                 'Authorization': `Bearer ${AppState.authToken}`
@@ -738,6 +772,8 @@ async function autoLogin() {
             document.getElementById('loginSection').classList.add('hidden');
             document.getElementById('mainSection').classList.remove('hidden');
             showStatus('自动登录成功', 'success');
+            // 显示面板后初始化滑块
+            requestAnimationFrame(() => initTabSlider());
             return true;
         } else if (response.status === 401) {
             localStorage.removeItem('gcli2api_auth_token');
@@ -767,18 +803,134 @@ function handlePasswordEnter(event) {
 // =====================================================================
 // 标签页切换
 // =====================================================================
+
+// 更新滑块位置
+function updateTabSlider(targetTab, animate = true) {
+    const slider = document.querySelector('.tab-slider');
+    const tabs = document.querySelector('.tabs');
+    if (!slider || !tabs || !targetTab) return;
+
+    // 获取按钮位置和容器宽度
+    const tabLeft = targetTab.offsetLeft;
+    const tabWidth = targetTab.offsetWidth;
+    const tabsWidth = tabs.scrollWidth;
+
+    // 使用 left 和 right 同时控制，确保动画同步
+    const rightValue = tabsWidth - tabLeft - tabWidth;
+
+    if (animate) {
+        slider.style.left = `${tabLeft}px`;
+        slider.style.right = `${rightValue}px`;
+    } else {
+        // 首次加载时不使用动画
+        slider.style.transition = 'none';
+        slider.style.left = `${tabLeft}px`;
+        slider.style.right = `${rightValue}px`;
+        // 强制重绘后恢复过渡
+        slider.offsetHeight;
+        slider.style.transition = '';
+    }
+}
+
+// 初始化滑块位置
+function initTabSlider() {
+    const activeTab = document.querySelector('.tab.active');
+    if (activeTab) {
+        updateTabSlider(activeTab, false);
+    }
+}
+
+// 页面加载和窗口大小变化时初始化滑块
+document.addEventListener('DOMContentLoaded', initTabSlider);
+window.addEventListener('resize', () => {
+    const activeTab = document.querySelector('.tab.active');
+    if (activeTab) updateTabSlider(activeTab, false);
+});
+
 function switchTab(tabName) {
+    // 获取当前活动的内容区域
+    const currentContent = document.querySelector('.tab-content.active');
+    const targetContent = document.getElementById(tabName + 'Tab');
+
+    // 如果点击的是当前标签页，不做任何操作
+    if (currentContent === targetContent) return;
+
+    // 找到目标标签按钮
+    const targetTab = event && event.target ? event.target :
+        document.querySelector(`.tab[onclick*="'${tabName}'"]`);
+
+    // 移除所有标签页的active状态
     document.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
-    document.querySelectorAll('.tab-content').forEach(content => content.classList.remove('active'));
 
-    event.target.classList.add('active');
-    document.getElementById(tabName + 'Tab').classList.add('active');
+    // 添加当前点击标签的active状态
+    if (targetTab) {
+        targetTab.classList.add('active');
+        // 更新滑块位置（带动画）
+        updateTabSlider(targetTab, true);
+    }
 
+    // 淡出当前内容
+    if (currentContent) {
+        // 设置淡出过渡
+        currentContent.style.transition = 'opacity 0.18s ease-out, transform 0.18s ease-out';
+        currentContent.style.opacity = '0';
+        currentContent.style.transform = 'translateX(-12px)';
+
+        setTimeout(() => {
+            currentContent.classList.remove('active');
+            currentContent.style.transition = '';
+            currentContent.style.opacity = '';
+            currentContent.style.transform = '';
+
+            // 淡入新内容
+            if (targetContent) {
+                // 先设置初始状态（在添加 active 类之前）
+                targetContent.style.opacity = '0';
+                targetContent.style.transform = 'translateX(12px)';
+                targetContent.style.transition = 'none'; // 暂时禁用过渡
+
+                // 添加 active 类使元素可见
+                targetContent.classList.add('active');
+
+                // 使用双重 requestAnimationFrame 确保浏览器完成重绘
+                requestAnimationFrame(() => {
+                    requestAnimationFrame(() => {
+                        // 启用过渡并应用最终状态
+                        targetContent.style.transition = 'opacity 0.25s ease-out, transform 0.25s ease-out';
+                        targetContent.style.opacity = '1';
+                        targetContent.style.transform = 'translateX(0)';
+
+                        // 清理内联样式并执行数据加载
+                        setTimeout(() => {
+                            targetContent.style.transition = '';
+                            targetContent.style.opacity = '';
+                            targetContent.style.transform = '';
+
+                            // 动画完成后触发数据加载
+                            triggerTabDataLoad(tabName);
+                        }, 260);
+                    });
+                });
+            }
+        }, 180);
+    } else {
+        // 如果没有当前内容（首次加载），直接显示目标内容
+        if (targetContent) {
+            targetContent.classList.add('active');
+            // 直接触发数据加载
+            triggerTabDataLoad(tabName);
+        }
+    }
+}
+
+// 标签页数据加载（从动画中分离出来）
+function triggerTabDataLoad(tabName) {
     if (tabName === 'manage') AppState.creds.refresh();
     if (tabName === 'antigravity-manage') AppState.antigravityCreds.refresh();
     if (tabName === 'config') loadConfig();
     if (tabName === 'logs') connectWebSocket();
 }
+
 
 // =====================================================================
 // OAuth认证相关函数
@@ -860,7 +1012,7 @@ async function getCredentials() {
         } else if (data.requires_project_selection && data.available_projects) {
             let projectOptions = "请选择一个项目：\n\n";
             data.available_projects.forEach((project, index) => {
-                projectOptions += `${index + 1}. ${project.name} (${project.projectId})\n`;
+                projectOptions += `${index + 1}. ${project.name} (${project.project_id})\n`;
             });
             projectOptions += `\n请输入序号 (1-${data.available_projects.length}):`;
 
@@ -868,7 +1020,7 @@ async function getCredentials() {
             const projectIndex = parseInt(selection) - 1;
 
             if (projectIndex >= 0 && projectIndex < data.available_projects.length) {
-                AppState.currentProjectId = data.available_projects[projectIndex].projectId;
+                AppState.currentProjectId = data.available_projects[projectIndex].project_id;
                 btn.textContent = '重新尝试获取认证文件';
                 showStatus(`使用选择的项目重新尝试...`, 'info');
                 setTimeout(() => getCredentials(), 1000);
@@ -909,7 +1061,7 @@ async function startAntigravityAuth() {
     try {
         showStatus('正在生成 Antigravity 认证链接...', 'info');
 
-        const response = await fetch('/auth/start', {
+        const response = await fetch('./auth/start', {
             method: 'POST',
             headers: getAuthHeaders(),
             body: JSON.stringify({ use_antigravity: true })
@@ -951,7 +1103,7 @@ async function getAntigravityCredentials() {
     try {
         showStatus('正在等待 Antigravity OAuth回调...', 'info');
 
-        const response = await fetch('/auth/callback', {
+        const response = await fetch('./auth/callback', {
             method: 'POST',
             headers: getAuthHeaders(),
             body: JSON.stringify({ use_antigravity: true })
@@ -1074,7 +1226,7 @@ async function processCallbackUrl() {
         } else if (result.requires_project_selection) {
             let msg = '<br><strong>可用项目：</strong><br>';
             result.available_projects.forEach(p => {
-                msg += `• ${p.name} (ID: ${p.projectId})<br>`;
+                msg += `• ${p.name} (ID: ${p.project_id})<br>`;
             });
             showStatus('检测到多个项目，请在高级选项中指定项目ID：' + msg, 'error');
         } else {
@@ -1082,7 +1234,6 @@ async function processCallbackUrl() {
         }
 
         document.getElementById('callbackUrlInput').value = '';
-        setTimeout(() => { if (typeof refreshCredsStatus === 'function') refreshCredsStatus(); }, 1000);
     } catch (error) {
         showStatus(`从回调URL获取凭证失败: ${error.message}`, 'error');
     }
@@ -1109,7 +1260,7 @@ async function processAntigravityCallbackUrl() {
     showStatus('正在从回调URL获取 Antigravity 凭证...', 'info');
 
     try {
-        const response = await fetch('/auth/callback-url', {
+        const response = await fetch('./auth/callback-url', {
             method: 'POST',
             headers: getAuthHeaders(),
             body: JSON.stringify({ callback_url: callbackUrl, use_antigravity: true })
@@ -1126,7 +1277,6 @@ async function processAntigravityCallbackUrl() {
         }
 
         document.getElementById('antigravityCallbackUrlInput').value = '';
-        setTimeout(() => AppState.antigravityCreds.refresh(), 1000);
     } catch (error) {
         showStatus(`从回调URL获取 Antigravity 凭证失败: ${error.message}`, 'error');
     }
@@ -1162,7 +1312,7 @@ function toggleSelectAll() {
 }
 function batchAction(action) { AppState.creds.batchAction(action); }
 function downloadCred(filename) {
-    fetch(`/creds/download/${filename}`, { headers: { 'Authorization': `Bearer ${AppState.authToken}` } })
+    fetch(`./creds/download/${filename}`, { headers: { 'Authorization': `Bearer ${AppState.authToken}` } })
         .then(r => r.ok ? r.blob() : Promise.reject())
         .then(blob => {
             const url = window.URL.createObjectURL(blob);
@@ -1177,7 +1327,7 @@ function downloadCred(filename) {
 }
 async function downloadAllCreds() {
     try {
-        const response = await fetch('/creds/download-all', {
+        const response = await fetch('./creds/download-all', {
             headers: { 'Authorization': `Bearer ${AppState.authToken}` }
         });
         if (response.ok) {
@@ -1210,7 +1360,7 @@ function toggleAntigravityFileSelection(filename) {
 }
 function toggleSelectAllAntigravity() {
     const checkbox = document.getElementById('selectAllAntigravityCheckbox');
-    const checkboxes = document.querySelectorAll('.antigravityfile-checkbox');
+    const checkboxes = document.querySelectorAll('.antigravityFile-checkbox');
 
     if (checkbox.checked) {
         checkboxes.forEach(cb => AppState.antigravityCreds.selectedFiles.add(cb.getAttribute('data-filename')));
@@ -1222,7 +1372,7 @@ function toggleSelectAllAntigravity() {
 }
 function batchAntigravityAction(action) { AppState.antigravityCreds.batchAction(action); }
 function downloadAntigravityCred(filename) {
-    fetch(`/antigravity/creds/download/${filename}`, { headers: getAuthHeaders() })
+    fetch(`./antigravity/creds/download/${filename}`, { headers: getAuthHeaders() })
         .then(r => r.ok ? r.blob() : Promise.reject())
         .then(blob => {
             const url = window.URL.createObjectURL(blob);
@@ -1242,7 +1392,7 @@ function deleteAntigravityCred(filename) {
 }
 async function downloadAllAntigravityCreds() {
     try {
-        const response = await fetch('/antigravity/creds/download-all', { headers: getAuthHeaders() });
+        const response = await fetch('./antigravity/creds/download-all', { headers: getAuthHeaders() });
         if (response.ok) {
             const blob = await response.blob();
             const url = window.URL.createObjectURL(blob);
@@ -1276,17 +1426,44 @@ function clearAntigravityFiles() { AppState.antigravityUploadFiles.clearFiles();
 function uploadAntigravityFiles() { AppState.antigravityUploadFiles.upload(); }
 
 // 邮箱相关
+// 辅助函数：根据文件名更新卡片中的邮箱显示
+function updateEmailDisplay(filename, email, isAntigravity = false) {
+    // 查找对应的凭证卡片
+    const containerId = isAntigravity ? 'antigravityCredsList' : 'credsList';
+    const container = document.getElementById(containerId);
+    if (!container) return false;
+
+    // 通过 data-filename 找到对应的复选框，再找到其父卡片
+    const checkbox = container.querySelector(`input[data-filename="${filename}"]`);
+    if (!checkbox) return false;
+
+    // 找到对应的 cred-card 元素
+    const card = checkbox.closest('.cred-card');
+    if (!card) return false;
+
+    // 找到邮箱显示元素
+    const emailDiv = card.querySelector('.cred-email');
+    if (emailDiv) {
+        emailDiv.textContent = email;
+        emailDiv.style.color = '#666';
+        emailDiv.style.fontStyle = 'normal';
+        return true;
+    }
+    return false;
+}
+
 async function fetchUserEmail(filename) {
     try {
         showStatus('正在获取用户邮箱...', 'info');
-        const response = await fetch(`/creds/fetch-email/${encodeURIComponent(filename)}`, {
+        const response = await fetch(`./creds/fetch-email/${encodeURIComponent(filename)}`, {
             method: 'POST',
             headers: getAuthHeaders()
         });
         const data = await response.json();
         if (response.ok && data.user_email) {
             showStatus(`成功获取邮箱: ${data.user_email}`, 'success');
-            await AppState.creds.refresh();
+            // 直接更新卡片中的邮箱显示，不刷新整个列表
+            updateEmailDisplay(filename, data.user_email, false);
         } else {
             showStatus(data.message || '无法获取用户邮箱', 'error');
         }
@@ -1298,14 +1475,15 @@ async function fetchUserEmail(filename) {
 async function fetchAntigravityUserEmail(filename) {
     try {
         showStatus('正在获取用户邮箱...', 'info');
-        const response = await fetch(`/antigravity/creds/fetch-email/${encodeURIComponent(filename)}`, {
+        const response = await fetch(`./antigravity/creds/fetch-email/${encodeURIComponent(filename)}`, {
             method: 'POST',
             headers: getAuthHeaders()
         });
         const data = await response.json();
         if (response.ok && data.user_email) {
             showStatus(`成功获取邮箱: ${data.user_email}`, 'success');
-            await AppState.antigravityCreds.refresh();
+            // 直接更新卡片中的邮箱显示，不刷新整个列表
+            updateEmailDisplay(filename, data.user_email, true);
         } else {
             showStatus(data.message || '无法获取用户邮箱', 'error');
         }
@@ -1314,12 +1492,346 @@ async function fetchAntigravityUserEmail(filename) {
     }
 }
 
+async function verifyProjectId(filename) {
+    try {
+        // 显示加载状态
+        showStatus('🔍 正在检验Project ID，请稍候...', 'info');
+
+        const response = await fetch(`./creds/verify-project/${encodeURIComponent(filename)}`, {
+            method: 'POST',
+            headers: getAuthHeaders()
+        });
+        const data = await response.json();
+
+        if (response.ok && data.success) {
+            // 成功时显示绿色成功消息和Project ID
+            const successMsg = `✅ 检验成功！\n文件: ${filename}\nProject ID: ${data.project_id}\n\n${data.message}`;
+            showStatus(successMsg.replace(/\n/g, '<br>'), 'success');
+
+            // 弹出成功提示
+            alert(`✅ 检验成功！\n\n文件: ${filename}\nProject ID: ${data.project_id}\n\n${data.message}`);
+
+            await AppState.creds.refresh();
+        } else {
+            // 失败时显示红色错误消息
+            const errorMsg = data.message || '检验失败';
+            showStatus(`❌ ${errorMsg}`, 'error');
+            alert(`❌ 检验失败\n\n${errorMsg}`);
+        }
+    } catch (error) {
+        const errorMsg = `检验失败: ${error.message}`;
+        showStatus(`❌ ${errorMsg}`, 'error');
+        alert(`❌ ${errorMsg}`);
+    }
+}
+
+async function verifyAntigravityProjectId(filename) {
+    try {
+        // 显示加载状态
+        showStatus('🔍 正在检验Antigravity Project ID，请稍候...', 'info');
+
+        const response = await fetch(`./antigravity/creds/verify-project/${encodeURIComponent(filename)}`, {
+            method: 'POST',
+            headers: getAuthHeaders()
+        });
+        const data = await response.json();
+
+        if (response.ok && data.success) {
+            // 成功时显示绿色成功消息和Project ID
+            const successMsg = `✅ 检验成功！\n文件: ${filename}\nProject ID: ${data.project_id}\n\n${data.message}`;
+            showStatus(successMsg.replace(/\n/g, '<br>'), 'success');
+
+            // 弹出成功提示
+            alert(`✅ Antigravity检验成功！\n\n文件: ${filename}\nProject ID: ${data.project_id}\n\n${data.message}`);
+
+            await AppState.antigravityCreds.refresh();
+        } else {
+            // 失败时显示红色错误消息
+            const errorMsg = data.message || '检验失败';
+            showStatus(`❌ ${errorMsg}`, 'error');
+            alert(`❌ 检验失败\n\n${errorMsg}`);
+        }
+    } catch (error) {
+        const errorMsg = `检验失败: ${error.message}`;
+        showStatus(`❌ ${errorMsg}`, 'error');
+        alert(`❌ ${errorMsg}`);
+    }
+}
+
+async function toggleAntigravityQuotaDetails(pathId) {
+    const quotaDetails = document.getElementById('quota-' + pathId);
+    if (!quotaDetails) return;
+
+    // 切换显示状态
+    const isShowing = quotaDetails.style.display === 'block';
+
+    if (isShowing) {
+        // 收起
+        quotaDetails.style.display = 'none';
+    } else {
+        // 展开
+        quotaDetails.style.display = 'block';
+
+        const contentDiv = quotaDetails.querySelector('.cred-quota-content');
+        const filename = contentDiv.getAttribute('data-filename');
+        const loaded = contentDiv.getAttribute('data-loaded');
+
+        // 如果还没加载过，则加载数据
+        if (loaded === 'false' && filename) {
+            contentDiv.innerHTML = '<div style="text-align: center; padding: 20px; color: #666;">📊 正在加载额度信息...</div>';
+
+            try {
+                const response = await fetch(`./antigravity/creds/quota/${encodeURIComponent(filename)}`, {
+                    method: 'GET',
+                    headers: getAuthHeaders()
+                });
+                const data = await response.json();
+
+                if (response.ok && data.success) {
+                    // 成功时渲染美化的额度信息
+                    const models = data.models || {};
+
+                    if (Object.keys(models).length === 0) {
+                        contentDiv.innerHTML = `
+                            <div style="text-align: center; padding: 20px; color: #999;">
+                                <div style="font-size: 48px; margin-bottom: 10px;">📊</div>
+                                <div>暂无额度信息</div>
+                            </div>
+                        `;
+                    } else {
+                        let quotaHTML = `
+                            <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 15px; border-radius: 8px 8px 0 0; margin: -10px -10px 15px -10px;">
+                                <h4 style="margin: 0; font-size: 16px; display: flex; align-items: center; gap: 8px;">
+                                    <span style="font-size: 20px;">📊</span>
+                                    <span>额度信息详情</span>
+                                </h4>
+                                <div style="font-size: 12px; opacity: 0.9; margin-top: 5px;">文件: ${filename}</div>
+                            </div>
+                            <div style="display: grid; gap: 12px;">
+                        `;
+
+                        for (const [modelName, quotaData] of Object.entries(models)) {
+                            // 后端返回的是剩余比例 (0-1)，不是绝对数量
+                            const remainingFraction = quotaData.remaining || 0;
+                            const resetTime = quotaData.resetTime || 'N/A';
+
+                            // 计算已使用百分比（1 - 剩余比例）
+                            const usedPercentage = Math.round((1 - remainingFraction) * 100);
+                            const remainingPercentage = Math.round(remainingFraction * 100);
+
+                            // 根据使用情况选择颜色
+                            let percentageColor = '#28a745'; // 绿色：使用少
+                            if (usedPercentage >= 90) percentageColor = '#dc3545'; // 红色：使用多
+                            else if (usedPercentage >= 70) percentageColor = '#ffc107'; // 黄色：使用较多
+                            else if (usedPercentage >= 50) percentageColor = '#17a2b8'; // 蓝色：使用中等
+
+                            quotaHTML += `
+                                <div style="background: #f8f9fa; border: 1px solid #e1e4e8; border-radius: 8px; padding: 12px; border-left: 4px solid #17a2b8;">
+                                    <div style="font-weight: bold; color: #333; margin-bottom: 8px; font-size: 14px;">
+                                        🔹 ${modelName}
+                                    </div>
+
+                                    <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin-bottom: 10px;">
+                                        <div style="background: white; padding: 8px; border-radius: 4px; border: 1px solid #dee2e6;">
+                                            <div style="font-size: 11px; color: #666; margin-bottom: 2px;">剩余额度</div>
+                                            <div style="font-size: 18px; font-weight: bold; color: #28a745;">${remainingPercentage}%</div>
+                                        </div>
+                                        <div style="background: white; padding: 8px; border-radius: 4px; border: 1px solid #dee2e6;">
+                                            <div style="font-size: 11px; color: #666; margin-bottom: 2px;">已使用</div>
+                                            <div style="font-size: 18px; font-weight: bold; color: #dc3545;">${usedPercentage}%</div>
+                                        </div>
+                                        <div style="background: white; padding: 8px; border-radius: 4px; border: 1px solid #dee2e6; grid-column: span 2;">
+                                            <div style="font-size: 11px; color: #666; margin-bottom: 2px;">重置时间</div>
+                                            <div style="font-size: 14px; font-weight: bold; color: #666;">${resetTime}</div>
+                                        </div>
+                                    </div>
+
+                                    <div>
+                                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                                            <span style="font-size: 11px; color: #666;">使用进度</span>
+                                            <span style="font-size: 12px; font-weight: bold; color: ${percentageColor};">${usedPercentage}%</span>
+                                        </div>
+                                        <div style="width: 100%; height: 10px; background-color: #e9ecef; border-radius: 5px; overflow: hidden;">
+                                            <div style="width: ${usedPercentage}%; height: 100%; background-color: ${percentageColor}; transition: width 0.3s ease;"></div>
+                                        </div>
+                                    </div>
+                                </div>
+                            `;
+                        }
+
+                        quotaHTML += '</div>';
+                        contentDiv.innerHTML = quotaHTML;
+                    }
+
+                    contentDiv.setAttribute('data-loaded', 'true');
+                    showStatus('✅ 成功加载额度信息', 'success');
+                } else {
+                    // 失败时显示错误
+                    const errorMsg = data.error || '获取额度信息失败';
+                    contentDiv.innerHTML = `
+                        <div style="text-align: center; padding: 20px; color: #dc3545;">
+                            <div style="font-size: 48px; margin-bottom: 10px;">❌</div>
+                            <div style="font-weight: bold; margin-bottom: 5px;">获取额度信息失败</div>
+                            <div style="font-size: 13px; color: #666;">${errorMsg}</div>
+                        </div>
+                    `;
+                    showStatus(`❌ ${errorMsg}`, 'error');
+                }
+            } catch (error) {
+                contentDiv.innerHTML = `
+                    <div style="text-align: center; padding: 20px; color: #dc3545;">
+                        <div style="font-size: 48px; margin-bottom: 10px;">❌</div>
+                        <div style="font-weight: bold; margin-bottom: 5px;">网络错误</div>
+                        <div style="font-size: 13px; color: #666;">${error.message}</div>
+                    </div>
+                `;
+                showStatus(`❌ 获取额度信息失败: ${error.message}`, 'error');
+            }
+        }
+    }
+}
+
+async function batchVerifyProjectIds() {
+    const selectedFiles = Array.from(AppState.creds.selectedFiles);
+    if (selectedFiles.length === 0) {
+        showStatus('❌ 请先选择要检验的凭证', 'error');
+        alert('请先选择要检验的凭证');
+        return;
+    }
+
+    if (!confirm(`确定要批量检验 ${selectedFiles.length} 个凭证的Project ID吗？\n\n将并行检验以加快速度。`)) {
+        return;
+    }
+
+    showStatus(`🔍 正在并行检验 ${selectedFiles.length} 个凭证，请稍候...`, 'info');
+
+    // 并行执行所有检验请求
+    const promises = selectedFiles.map(async (filename) => {
+        try {
+            const response = await fetch(`./creds/verify-project/${encodeURIComponent(filename)}`, {
+                method: 'POST',
+                headers: getAuthHeaders()
+            });
+            const data = await response.json();
+
+            if (response.ok && data.success) {
+                return { success: true, filename, projectId: data.project_id, message: data.message };
+            } else {
+                return { success: false, filename, error: data.message || '失败' };
+            }
+        } catch (error) {
+            return { success: false, filename, error: error.message };
+        }
+    });
+
+    // 等待所有请求完成
+    const results = await Promise.all(promises);
+
+    // 统计结果
+    let successCount = 0;
+    let failCount = 0;
+    const resultMessages = [];
+
+    results.forEach(result => {
+        if (result.success) {
+            successCount++;
+            resultMessages.push(`✅ ${result.filename}: ${result.projectId}`);
+        } else {
+            failCount++;
+            resultMessages.push(`❌ ${result.filename}: ${result.error}`);
+        }
+    });
+
+    await AppState.creds.refresh();
+
+    const summary = `批量检验完成！\n\n成功: ${successCount} 个\n失败: ${failCount} 个\n总计: ${selectedFiles.length} 个\n\n详细结果:\n${resultMessages.join('\n')}`;
+
+    if (failCount === 0) {
+        showStatus(`✅ 全部检验成功！成功检验 ${successCount}/${selectedFiles.length} 个凭证`, 'success');
+    } else if (successCount === 0) {
+        showStatus(`❌ 全部检验失败！失败 ${failCount}/${selectedFiles.length} 个凭证`, 'error');
+    } else {
+        showStatus(`⚠️ 批量检验完成：成功 ${successCount}/${selectedFiles.length} 个，失败 ${failCount} 个`, 'info');
+    }
+
+    console.log(summary);
+    alert(summary);
+}
+
+async function batchVerifyAntigravityProjectIds() {
+    const selectedFiles = Array.from(AppState.antigravityCreds.selectedFiles);
+    if (selectedFiles.length === 0) {
+        showStatus('❌ 请先选择要检验的Antigravity凭证', 'error');
+        alert('请先选择要检验的Antigravity凭证');
+        return;
+    }
+
+    if (!confirm(`确定要批量检验 ${selectedFiles.length} 个Antigravity凭证的Project ID吗？\n\n将并行检验以加快速度。`)) {
+        return;
+    }
+
+    showStatus(`🔍 正在并行检验 ${selectedFiles.length} 个Antigravity凭证，请稍候...`, 'info');
+
+    // 并行执行所有检验请求
+    const promises = selectedFiles.map(async (filename) => {
+        try {
+            const response = await fetch(`./antigravity/creds/verify-project/${encodeURIComponent(filename)}`, {
+                method: 'POST',
+                headers: getAuthHeaders()
+            });
+            const data = await response.json();
+
+            if (response.ok && data.success) {
+                return { success: true, filename, projectId: data.project_id, message: data.message };
+            } else {
+                return { success: false, filename, error: data.message || '失败' };
+            }
+        } catch (error) {
+            return { success: false, filename, error: error.message };
+        }
+    });
+
+    // 等待所有请求完成
+    const results = await Promise.all(promises);
+
+    // 统计结果
+    let successCount = 0;
+    let failCount = 0;
+    const resultMessages = [];
+
+    results.forEach(result => {
+        if (result.success) {
+            successCount++;
+            resultMessages.push(`✅ ${result.filename}: ${result.projectId}`);
+        } else {
+            failCount++;
+            resultMessages.push(`❌ ${result.filename}: ${result.error}`);
+        }
+    });
+
+    await AppState.antigravityCreds.refresh();
+
+    const summary = `Antigravity批量检验完成！\n\n成功: ${successCount} 个\n失败: ${failCount} 个\n总计: ${selectedFiles.length} 个\n\n详细结果:\n${resultMessages.join('\n')}`;
+
+    if (failCount === 0) {
+        showStatus(`✅ 全部检验成功！成功检验 ${successCount}/${selectedFiles.length} 个Antigravity凭证`, 'success');
+    } else if (successCount === 0) {
+        showStatus(`❌ 全部检验失败！失败 ${failCount}/${selectedFiles.length} 个Antigravity凭证`, 'error');
+    } else {
+        showStatus(`⚠️ 批量检验完成：成功 ${successCount}/${selectedFiles.length} 个，失败 ${failCount} 个`, 'info');
+    }
+
+    console.log(summary);
+    alert(summary);
+}
+
+
 async function refreshAllEmails() {
     if (!confirm('确定要刷新所有凭证的用户邮箱吗？这可能需要一些时间。')) return;
 
     try {
         showStatus('正在刷新所有用户邮箱...', 'info');
-        const response = await fetch('/creds/refresh-all-emails', {
+        const response = await fetch('./creds/refresh-all-emails', {
             method: 'POST',
             headers: getAuthHeaders()
         });
@@ -1340,7 +1852,7 @@ async function refreshAllAntigravityEmails() {
 
     try {
         showStatus('正在刷新所有用户邮箱...', 'info');
-        const response = await fetch('/antigravity/creds/refresh-all-emails', {
+        const response = await fetch('./antigravity/creds/refresh-all-emails', {
             method: 'POST',
             headers: getAuthHeaders()
         });
@@ -1366,8 +1878,8 @@ function connectWebSocket() {
     }
 
     try {
-        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsUrl = `${protocol}//${window.location.host}/auth/logs/stream`;
+        const wsPath = new URL('./auth/logs/stream', window.location.href).href;
+        const wsUrl = wsPath.replace(/^http/, 'ws');
 
         document.getElementById('connectionStatusText').textContent = '连接中...';
         document.getElementById('logConnectionStatus').className = 'status info';
@@ -1432,7 +1944,7 @@ function clearLogsDisplay() {
 
 async function downloadLogs() {
     try {
-        const response = await fetch('/auth/logs/download', { headers: getAuthHeaders() });
+        const response = await fetch('./auth/logs/download', { headers: getAuthHeaders() });
 
         if (response.ok) {
             const contentDisposition = response.headers.get('Content-Disposition');
@@ -1462,7 +1974,7 @@ async function downloadLogs() {
 
 async function clearLogs() {
     try {
-        const response = await fetch('/auth/logs/clear', {
+        const response = await fetch('./auth/logs/clear', {
             method: 'POST',
             headers: getAuthHeaders()
         });
@@ -1515,7 +2027,7 @@ async function checkEnvCredsStatus() {
         loading.style.display = 'block';
         content.classList.add('hidden');
 
-        const response = await fetch('/auth/env-creds-status', { headers: getAuthHeaders() });
+        const response = await fetch('./auth/env-creds-status', { headers: getAuthHeaders() });
         const data = await response.json();
 
         if (response.ok) {
@@ -1610,7 +2122,7 @@ async function loadConfig() {
         loading.style.display = 'block';
         form.classList.add('hidden');
 
-        const response = await fetch('/config/get', { headers: getAuthHeaders() });
+        const response = await fetch('./config/get', { headers: getAuthHeaders() });
         const data = await response.json();
 
         if (response.ok) {
@@ -1791,8 +2303,8 @@ async function refreshUsageStats() {
         list.innerHTML = '';
 
         const [statsResponse, aggregatedResponse] = await Promise.all([
-            fetch('/usage/stats', { headers: getAuthHeaders() }),
-            fetch('/usage/aggregated', { headers: getAuthHeaders() })
+            fetch('./usage/stats', { headers: getAuthHeaders() }),
+            fetch('./usage/aggregated', { headers: getAuthHeaders() })
         ]);
 
         if (statsResponse.status === 401 || aggregatedResponse.status === 401) {
@@ -1929,18 +2441,15 @@ function stopCooldownTimer() {
 function updateCooldownDisplays() {
     let needsRefresh = false;
 
+    // 检查模型级冷却是否过期
     for (const credInfo of Object.values(AppState.creds.data)) {
-        if (credInfo.cooldown_status === 'cooling' && credInfo.cooldown_until) {
+        if (credInfo.model_cooldowns && Object.keys(credInfo.model_cooldowns).length > 0) {
             const currentTime = Date.now() / 1000;
-            const remainingSeconds = Math.max(0, Math.floor(credInfo.cooldown_until - currentTime));
+            const hasExpiredCooldowns = Object.entries(credInfo.model_cooldowns).some(([, until]) => until <= currentTime);
 
-            credInfo.cooldown_remaining_seconds = remainingSeconds;
-
-            if (remainingSeconds <= 0) {
-                credInfo.cooldown_status = 'ready';
-                credInfo.cooldown_until = null;
-                credInfo.cooldown_remaining_seconds = 0;
+            if (hasExpiredCooldowns) {
                 needsRefresh = true;
+                break;
             }
         }
     }
@@ -1950,6 +2459,7 @@ function updateCooldownDisplays() {
         return;
     }
 
+    // 更新模型级冷却的显示
     document.querySelectorAll('.cooldown-badge').forEach(badge => {
         const card = badge.closest('.cred-card');
         const filenameEl = card?.querySelector('.cred-filename');
@@ -1958,10 +2468,21 @@ function updateCooldownDisplays() {
         const filename = filenameEl.textContent;
         const credInfo = Object.values(AppState.creds.data).find(c => c.filename === filename);
 
-        if (credInfo && credInfo.cooldown_status === 'cooling') {
-            const remaining = credInfo.cooldown_remaining_seconds || 0;
-            if (remaining > 0) {
-                badge.innerHTML = `🕐 冷却中: ${formatCooldownTime(remaining)}`;
+        if (credInfo && credInfo.model_cooldowns) {
+            const currentTime = Date.now() / 1000;
+            const titleMatch = badge.getAttribute('title')?.match(/模型: (.+)/);
+            if (titleMatch) {
+                const model = titleMatch[1];
+                const cooldownUntil = credInfo.model_cooldowns[model];
+                if (cooldownUntil) {
+                    const remaining = Math.max(0, Math.floor(cooldownUntil - currentTime));
+                    if (remaining > 0) {
+                        const shortModel = model.replace('gemini-', '').replace('-exp', '')
+                            .replace('2.0-', '2-').replace('1.5-', '1.5-');
+                        const timeDisplay = formatCooldownTime(remaining).replace(/s$/, '').replace(/ /g, '');
+                        badge.innerHTML = `🔧 ${shortModel}: ${timeDisplay}`;
+                    }
+                }
             }
         }
     });
@@ -1970,7 +2491,7 @@ function updateCooldownDisplays() {
 // =====================================================================
 // 页面初始化
 // =====================================================================
-window.onload = async function() {
+window.onload = async function () {
     const autoLoginSuccess = await autoLogin();
 
     if (!autoLoginSuccess) {
@@ -1986,7 +2507,7 @@ window.onload = async function() {
 };
 
 // 拖拽功能 - 初始化
-document.addEventListener('DOMContentLoaded', function() {
+document.addEventListener('DOMContentLoaded', function () {
     const uploadArea = document.getElementById('uploadArea');
 
     if (uploadArea) {

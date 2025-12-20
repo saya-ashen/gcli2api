@@ -19,6 +19,7 @@ from src.gemini_router import router as gemini_router
 
 # Import all routers
 from src.antigravity_router import router as antigravity_router
+from src.antigravity_anthropic_router import router as antigravity_anthropic_router
 from src.openai_router import router as openai_router
 from src.task_manager import shutdown_all_tasks
 from src.web_routes import router as web_router
@@ -104,6 +105,9 @@ app.include_router(gemini_router, prefix="", tags=["Gemini Native API"])
 # Antigravity路由 - 处理OpenAI格式请求并转换为Antigravity API
 app.include_router(antigravity_router, prefix="", tags=["Antigravity API"])
 
+# Antigravity Anthropic Messages 路由 - Anthropic Messages 格式兼容
+app.include_router(antigravity_anthropic_router, prefix="", tags=["Antigravity Anthropic Messages"])
+
 # Web路由 - 包含认证、凭证管理和控制面板功能
 app.include_router(web_router, prefix="", tags=["Web Interface"])
 
@@ -147,7 +151,10 @@ async def main():
     log.info("API端点:")
     log.info(f"   OpenAI兼容: http://127.0.0.1:{port}/v1")
     log.info(f"   Gemini原生: http://127.0.0.1:{port}")
-    log.info(f"   Antigravity: http://127.0.0.1:{port}/antigravity/v1")
+    log.info(f"   Antigravity (OpenAI格式): http://127.0.0.1:{port}/antigravity/v1")
+    log.info(f"   Antigravity (claude格式): http://127.0.0.1:{port}/antigravity/v1")
+    log.info(f"   Antigravity (Gemini格式): http://127.0.0.1:{port}/antigravity")
+    log.info(f"   Antigravity (SD-WebUI格式): http://127.0.0.1:{port}/antigravity")
 
     # 配置hypercorn
     config = Config()

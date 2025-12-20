@@ -11,7 +11,7 @@ import os
 import time
 import zipfile
 from collections import deque
-from typing import List, Optional
+from typing import List
 
 from fastapi import (
     APIRouter,
@@ -24,8 +24,6 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel
 from starlette.websockets import WebSocketState
 
 import config
@@ -35,17 +33,27 @@ from .auth import (
     asyncio_complete_auth_flow,
     complete_auth_flow_from_callback_url,
     create_auth_url,
-    generate_auth_token,
     get_auth_status,
-    verify_auth_token,
     verify_password,
 )
 from .credential_manager import CredentialManager
+from .models import (
+    LoginRequest,
+    AuthStartRequest,
+    AuthCallbackRequest,
+    AuthCallbackUrlRequest,
+    CredFileActionRequest,
+    CredFileBatchActionRequest,
+    ConfigSaveRequest,
+)
 from .storage_adapter import get_storage_adapter
+from .utils import verify_panel_token, STANDARD_USER_AGENT, ANTIGRAVITY_USER_AGENT
+from .antigravity_api import fetch_quota_info
+from .google_oauth_api import Credentials, fetch_project_id
+from config import get_code_assist_endpoint, get_antigravity_api_url
 
 # 创建路由器
 router = APIRouter()
-security = HTTPBearer()
 
 # 创建credential manager实例
 credential_manager = CredentialManager()
@@ -147,58 +155,6 @@ async def get_credential_manager():
     return credential_manager
 
 
-async def authenticate(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
-    """验证用户密码（控制面板使用）"""
-    from config import get_panel_password
-
-    password = await get_panel_password()
-    token = credentials.credentials
-    if token != password:
-        raise HTTPException(status_code=403, detail="密码错误")
-    return token
-
-
-class LoginRequest(BaseModel):
-    password: str
-
-
-class AuthStartRequest(BaseModel):
-    project_id: Optional[str] = None  # 现在是可选的
-    use_antigravity: Optional[bool] = False  # 是否使用antigravity模式
-
-
-class AuthCallbackRequest(BaseModel):
-    project_id: Optional[str] = None  # 现在是可选的
-    use_antigravity: Optional[bool] = False  # 是否使用antigravity模式
-
-
-class AuthCallbackUrlRequest(BaseModel):
-    callback_url: str  # OAuth回调完整URL
-    project_id: Optional[str] = None  # 可选的项目ID
-    use_antigravity: Optional[bool] = False  # 是否使用antigravity模式
-
-
-class CredFileActionRequest(BaseModel):
-    filename: str
-    action: str  # enable, disable, delete
-
-
-class CredFileBatchActionRequest(BaseModel):
-    action: str  # "enable", "disable", "delete"
-    filenames: List[str]  # 批量操作的文件名列表
-
-
-class ConfigSaveRequest(BaseModel):
-    config: dict
-
-
-def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """验证认证令牌"""
-    if not verify_auth_token(credentials.credentials):
-        raise HTTPException(status_code=401, detail="无效的认证令牌")
-    return credentials.credentials
-
-
 def is_mobile_user_agent(user_agent: str) -> bool:
     """检测是否为移动设备用户代理"""
     if not user_agent:
@@ -255,11 +211,11 @@ async def serve_control_panel(request: Request):
 
 @router.post("/auth/login")
 async def login(request: LoginRequest):
-    """用户登录"""
+    """用户登录（简化版：直接返回密码作为token）"""
     try:
         if await verify_password(request.password):
-            token = generate_auth_token()
-            return JSONResponse(content={"token": token, "message": "登录成功"})
+            # 直接使用密码作为token，简化认证流程
+            return JSONResponse(content={"token": request.password, "message": "登录成功"})
         else:
             raise HTTPException(status_code=401, detail="密码错误")
     except HTTPException:
@@ -270,7 +226,7 @@ async def login(request: LoginRequest):
 
 
 @router.post("/auth/start")
-async def start_auth(request: AuthStartRequest, token: str = Depends(verify_token)):
+async def start_auth(request: AuthStartRequest, token: str = Depends(verify_panel_token)):
     """开始认证流程，支持自动检测项目ID"""
     try:
         # 如果没有提供项目ID，尝试自动检测
@@ -304,7 +260,7 @@ async def start_auth(request: AuthStartRequest, token: str = Depends(verify_toke
 
 
 @router.post("/auth/callback")
-async def auth_callback(request: AuthCallbackRequest, token: str = Depends(verify_token)):
+async def auth_callback(request: AuthCallbackRequest, token: str = Depends(verify_panel_token)):
     """处理认证回调，支持自动检测项目ID"""
     try:
         # 项目ID现在是可选的，在回调处理中进行自动检测
@@ -356,7 +312,7 @@ async def auth_callback(request: AuthCallbackRequest, token: str = Depends(verif
 
 
 @router.post("/auth/callback-url")
-async def auth_callback_url(request: AuthCallbackUrlRequest, token: str = Depends(verify_token)):
+async def auth_callback_url(request: AuthCallbackUrlRequest, token: str = Depends(verify_panel_token)):
     """从回调URL直接完成认证"""
     try:
         # 验证URL格式
@@ -405,7 +361,7 @@ async def auth_callback_url(request: AuthCallbackUrlRequest, token: str = Depend
 
 
 @router.get("/auth/status/{project_id}")
-async def check_auth_status(project_id: str, token: str = Depends(verify_token)):
+async def check_auth_status(project_id: str, token: str = Depends(verify_panel_token)):
     """检查认证状态"""
     try:
         if not project_id:
@@ -422,21 +378,6 @@ async def check_auth_status(project_id: str, token: str = Depends(verify_token))
 # =============================================================================
 # 工具函数 (Helper Functions)
 # =============================================================================
-
-
-def calculate_cooldown_status(cooldown_until: Optional[float]) -> tuple:
-    """计算冷却状态
-
-    Returns:
-        (cooldown_status, cooldown_remaining_seconds)
-    """
-    if not cooldown_until:
-        return "ready", 0
-
-    current_time = time.time()
-    if current_time < cooldown_until:
-        return "cooling", int(cooldown_until - current_time)
-    return "ready", 0
 
 
 def get_env_locked_keys() -> set:
@@ -581,6 +522,8 @@ async def upload_credentials_common(
         async def process_single_file(file_data):
             try:
                 filename = file_data["filename"]
+                # 确保文件名只保存basename，避免路径问题
+                filename = os.path.basename(filename)
                 content_str = file_data["content"]
                 credential_data = json.loads(content_str)
 
@@ -650,16 +593,19 @@ async def upload_credentials_common(
 
 
 async def get_creds_status_common(
-    offset: int, limit: int, status_filter: str, is_antigravity: bool = False
+    offset: int, limit: int, status_filter: str, is_antigravity: bool = False,
+    error_code_filter: str = None, cooldown_filter: str = None
 ) -> JSONResponse:
     """获取凭证文件状态的通用函数"""
     # 验证分页参数
     if offset < 0:
         raise HTTPException(status_code=400, detail="offset 必须大于等于 0")
-    if limit not in [20, 50, 100]:
-        raise HTTPException(status_code=400, detail="limit 只能是 20、50 或 100")
+    if limit not in [20, 50, 100, 200, 500, 1000]:
+        raise HTTPException(status_code=400, detail="limit 只能是 20、50、100、200、500 或 1000")
     if status_filter not in ["all", "enabled", "disabled"]:
         raise HTTPException(status_code=400, detail="status_filter 只能是 all、enabled 或 disabled")
+    if cooldown_filter and cooldown_filter not in ["all", "in_cooldown", "no_cooldown"]:
+        raise HTTPException(status_code=400, detail="cooldown_filter 只能是 all、in_cooldown 或 no_cooldown")
 
     await ensure_credential_manager_initialized()
 
@@ -673,29 +619,22 @@ async def get_creds_status_common(
             offset=offset,
             limit=limit,
             status_filter=status_filter,
-            is_antigravity=is_antigravity
+            is_antigravity=is_antigravity,
+            error_code_filter=error_code_filter if error_code_filter and error_code_filter != "all" else None,
+            cooldown_filter=cooldown_filter if cooldown_filter and cooldown_filter != "all" else None
         )
 
         creds_list = []
         for summary in result["items"]:
-            cooldown_status, cooldown_remaining_seconds = calculate_cooldown_status(
-                summary.get("cooldown_until")
-            )
-
             cred_info = {
                 "filename": os.path.basename(summary["filename"]),
                 "user_email": summary["user_email"],
                 "disabled": summary["disabled"],
                 "error_codes": summary["error_codes"],
                 "last_success": summary["last_success"],
-                "cooldown_status": cooldown_status,
-                "cooldown_remaining_seconds": cooldown_remaining_seconds,
                 "backend_type": backend_type,
                 "model_cooldowns": summary.get("model_cooldowns", {}),
             }
-
-            if summary.get("cooldown_until"):
-                cred_info["cooldown_until"] = summary["cooldown_until"]
 
             creds_list.append(cred_info)
 
@@ -705,6 +644,7 @@ async def get_creds_status_common(
             "offset": offset,
             "limit": limit,
             "has_more": (offset + limit) < result["total"],
+            "stats": result.get("stats", {"total": 0, "normal": 0, "disabled": 0}),
         })
 
     # 回退到传统方式（MongoDB/其他后端）
@@ -736,24 +676,15 @@ async def get_creds_status_common(
             "user_email": None,
         })
 
-        cooldown_status, cooldown_remaining_seconds = calculate_cooldown_status(
-            file_status.get("cooldown_until")
-        )
-
         cred_info = {
             "filename": os.path.basename(filename),
             "user_email": file_status.get("user_email"),
             "disabled": file_status.get("disabled", False),
             "error_codes": file_status.get("error_codes", []),
             "last_success": file_status.get("last_success", time.time()),
-            "cooldown_status": cooldown_status,
-            "cooldown_remaining_seconds": cooldown_remaining_seconds,
             "backend_type": backend_type,
             "model_cooldowns": file_status.get("model_cooldowns", {}),
         }
-
-        if file_status.get("cooldown_until"):
-            cred_info["cooldown_until"] = file_status["cooldown_until"]
 
         creds_list.append(cred_info)
 
@@ -894,7 +825,7 @@ async def refresh_all_user_emails_common(is_antigravity: bool = False) -> JSONRe
 
 @router.post("/auth/upload")
 async def upload_credentials(
-    files: List[UploadFile] = File(...), token: str = Depends(verify_token)
+    files: List[UploadFile] = File(...), token: str = Depends(verify_panel_token)
 ):
     """批量上传认证文件"""
     try:
@@ -908,24 +839,32 @@ async def upload_credentials(
 
 @router.get("/creds/status")
 async def get_creds_status(
-    token: str = Depends(verify_token),
+    token: str = Depends(verify_panel_token),
     offset: int = 0,
     limit: int = 50,
-    status_filter: str = "all"
+    status_filter: str = "all",
+    error_code_filter: str = "all",
+    cooldown_filter: str = "all"
 ):
     """
     获取凭证文件的状态（轻量级摘要，不包含完整凭证数据，支持分页和状态筛选）
 
     Args:
         offset: 跳过的记录数（默认0）
-        limit: 每页返回的记录数（默认50，可选：20, 50, 100）
+        limit: 每页返回的记录数（默认50，可选：20, 50, 100, 200, 500, 1000）
         status_filter: 状态筛选（all=全部, enabled=仅启用, disabled=仅禁用）
+        error_code_filter: 错误码筛选（all=全部, 或具体错误码如"400", "403"）
+        cooldown_filter: 冷却状态筛选（all=全部, in_cooldown=冷却中, no_cooldown=未冷却）
 
     Returns:
         包含凭证列表、总数、分页信息的响应
     """
     try:
-        return await get_creds_status_common(offset, limit, status_filter, is_antigravity=False)
+        return await get_creds_status_common(
+            offset, limit, status_filter, is_antigravity=False,
+            error_code_filter=error_code_filter,
+            cooldown_filter=cooldown_filter
+        )
     except HTTPException:
         raise
     except Exception as e:
@@ -934,7 +873,7 @@ async def get_creds_status(
 
 
 @router.get("/creds/detail/{filename}")
-async def get_cred_detail(filename: str, token: str = Depends(verify_token)):
+async def get_cred_detail(filename: str, token: str = Depends(verify_panel_token)):
     """
     按需获取单个凭证的详细数据（包含完整凭证内容）
     用于用户查看/编辑凭证详情
@@ -965,29 +904,14 @@ async def get_cred_detail(filename: str, token: str = Depends(verify_token)):
                 "user_email": None,
             }
 
-        # 计算冷却状态
-        cooldown_until = file_status.get("cooldown_until")
-        cooldown_status = "ready"
-        cooldown_remaining_seconds = 0
-
-        if cooldown_until:
-            current_time = time.time()
-            if current_time < cooldown_until:
-                cooldown_status = "cooling"
-                cooldown_remaining_seconds = int(cooldown_until - current_time)
-
         result = {
             "status": file_status,
             "content": credential_data,
             "filename": os.path.basename(filename),
             "backend_type": backend_type,
             "user_email": file_status.get("user_email"),
-            "cooldown_status": cooldown_status,
-            "cooldown_remaining_seconds": cooldown_remaining_seconds,
+            "model_cooldowns": file_status.get("model_cooldowns", {}),
         }
-
-        if cooldown_until:
-            result["cooldown_until"] = cooldown_until
 
         if backend_type == "file" and os.path.exists(filename):
             result.update({
@@ -1005,7 +929,7 @@ async def get_cred_detail(filename: str, token: str = Depends(verify_token)):
 
 
 @router.post("/creds/action")
-async def creds_action(request: CredFileActionRequest, token: str = Depends(verify_token)):
+async def creds_action(request: CredFileActionRequest, token: str = Depends(verify_panel_token)):
     """对凭证文件执行操作（启用/禁用/删除）"""
     try:
         await ensure_credential_manager_initialized()
@@ -1073,7 +997,7 @@ async def creds_action(request: CredFileActionRequest, token: str = Depends(veri
 
 @router.post("/creds/batch-action")
 async def creds_batch_action(
-    request: CredFileBatchActionRequest, token: str = Depends(verify_token)
+    request: CredFileBatchActionRequest, token: str = Depends(verify_panel_token)
 ):
     """批量对凭证文件执行操作（启用/禁用/删除）"""
     try:
@@ -1159,7 +1083,7 @@ async def creds_batch_action(
 
 
 @router.get("/creds/download/{filename}")
-async def download_cred_file(filename: str, token: str = Depends(verify_token)):
+async def download_cred_file(filename: str, token: str = Depends(verify_panel_token)):
     """下载单个凭证文件"""
     try:
         # 验证文件名安全性
@@ -1193,7 +1117,7 @@ async def download_cred_file(filename: str, token: str = Depends(verify_token)):
 
 
 @router.post("/creds/fetch-email/{filename}")
-async def fetch_user_email(filename: str, token: str = Depends(verify_token)):
+async def fetch_user_email(filename: str, token: str = Depends(verify_panel_token)):
     """获取指定凭证文件的用户邮箱地址"""
     try:
         return await fetch_user_email_common(filename, is_antigravity=False)
@@ -1205,7 +1129,7 @@ async def fetch_user_email(filename: str, token: str = Depends(verify_token)):
 
 
 @router.post("/creds/refresh-all-emails")
-async def refresh_all_user_emails(token: str = Depends(verify_token)):
+async def refresh_all_user_emails(token: str = Depends(verify_panel_token)):
     """刷新所有凭证文件的用户邮箱地址"""
     try:
         return await refresh_all_user_emails_common(is_antigravity=False)
@@ -1215,7 +1139,7 @@ async def refresh_all_user_emails(token: str = Depends(verify_token)):
 
 
 @router.get("/creds/download-all")
-async def download_all_creds(token: str = Depends(verify_token)):
+async def download_all_creds(token: str = Depends(verify_panel_token)):
     """
     打包下载所有凭证文件（流式处理，按需加载每个凭证数据）
     只在实际下载时才加载完整凭证内容，最大化性能
@@ -1230,7 +1154,7 @@ async def download_all_creds(token: str = Depends(verify_token)):
 
 
 @router.get("/config/get")
-async def get_config(token: str = Depends(verify_token)):
+async def get_config(token: str = Depends(verify_panel_token)):
     """获取当前配置"""
     try:
         await ensure_credential_manager_initialized()
@@ -1295,7 +1219,7 @@ async def get_config(token: str = Depends(verify_token)):
 
 
 @router.post("/config/save")
-async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_token)):
+async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_panel_token)):
     """保存配置到TOML文件"""
     try:
         await ensure_credential_manager_initialized()
@@ -1411,7 +1335,7 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_to
 
 
 @router.post("/auth/logs/clear")
-async def clear_logs(token: str = Depends(verify_token)):
+async def clear_logs(token: str = Depends(verify_panel_token)):
     """清空日志文件"""
     try:
         # 直接使用环境变量获取日志文件路径
@@ -1444,7 +1368,7 @@ async def clear_logs(token: str = Depends(verify_token)):
 
 
 @router.get("/auth/logs/download")
-async def download_logs(token: str = Depends(verify_token)):
+async def download_logs(token: str = Depends(verify_panel_token)):
     """下载日志文件"""
     try:
         # 直接使用环境变量获取日志文件路径
@@ -1602,7 +1526,7 @@ async def websocket_logs(websocket: WebSocket):
 
 @router.post("/antigravity/upload")
 async def upload_antigravity_credentials(
-    files: List[UploadFile] = File(...), token: str = Depends(verify_token)
+    files: List[UploadFile] = File(...), token: str = Depends(verify_panel_token)
 ):
     """批量上传Antigravity认证文件"""
     try:
@@ -1616,24 +1540,32 @@ async def upload_antigravity_credentials(
 
 @router.get("/antigravity/creds/status")
 async def get_antigravity_creds_status(
-    token: str = Depends(verify_token),
+    token: str = Depends(verify_panel_token),
     offset: int = 0,
     limit: int = 50,
-    status_filter: str = "all"
+    status_filter: str = "all",
+    error_code_filter: str = "all",
+    cooldown_filter: str = "all"
 ):
     """
     获取Antigravity凭证文件的状态（轻量级摘要，不包含完整凭证数据，支持分页和状态筛选）
 
     Args:
         offset: 跳过的记录数（默认0）
-        limit: 每页返回的记录数（默认50，可选：20, 50, 100）
+        limit: 每页返回的记录数（默认50，可选：20, 50, 100, 200, 500, 1000）
         status_filter: 状态筛选（all=全部, enabled=仅启用, disabled=仅禁用）
+        error_code_filter: 错误码筛选（all=全部, 或具体错误码如"400", "403"）
+        cooldown_filter: 冷却状态筛选（all=全部, in_cooldown=冷却中, no_cooldown=未冷却）
 
     Returns:
         包含凭证列表、总数、分页信息的响应
     """
     try:
-        return await get_creds_status_common(offset, limit, status_filter, is_antigravity=True)
+        return await get_creds_status_common(
+            offset, limit, status_filter, is_antigravity=True,
+            error_code_filter=error_code_filter,
+            cooldown_filter=cooldown_filter
+        )
     except HTTPException:
         raise
     except Exception as e:
@@ -1642,7 +1574,7 @@ async def get_antigravity_creds_status(
 
 
 @router.post("/antigravity/creds/action")
-async def antigravity_cred_action(request: CredFileActionRequest, token: str = Depends(verify_token)):
+async def antigravity_cred_action(request: CredFileActionRequest, token: str = Depends(verify_panel_token)):
     """对 antigravity 凭证执行操作（启用/禁用/删除）"""
     try:
         storage_adapter = await get_storage_adapter()
@@ -1671,7 +1603,7 @@ async def antigravity_cred_action(request: CredFileActionRequest, token: str = D
 
 
 @router.get("/antigravity/creds/download/{filename}")
-async def download_antigravity_cred(filename: str, token: str = Depends(verify_token)):
+async def download_antigravity_cred(filename: str, token: str = Depends(verify_panel_token)):
     """下载 antigravity 凭证文件"""
     try:
         storage_adapter = await get_storage_adapter()
@@ -1695,7 +1627,7 @@ async def download_antigravity_cred(filename: str, token: str = Depends(verify_t
 
 
 @router.post("/antigravity/creds/batch-action")
-async def antigravity_batch_action(request: CredFileBatchActionRequest, token: str = Depends(verify_token)):
+async def antigravity_batch_action(request: CredFileBatchActionRequest, token: str = Depends(verify_panel_token)):
     """批量操作 antigravity 凭证"""
     try:
         storage_adapter = await get_storage_adapter()
@@ -1734,7 +1666,7 @@ async def antigravity_batch_action(request: CredFileBatchActionRequest, token: s
 
 
 @router.post("/antigravity/creds/fetch-email/{filename}")
-async def fetch_antigravity_user_email(filename: str, token: str = Depends(verify_token)):
+async def fetch_antigravity_user_email(filename: str, token: str = Depends(verify_panel_token)):
     """获取指定Antigravity凭证文件的用户邮箱地址"""
     try:
         return await fetch_user_email_common(filename, is_antigravity=True)
@@ -1746,7 +1678,7 @@ async def fetch_antigravity_user_email(filename: str, token: str = Depends(verif
 
 
 @router.post("/antigravity/creds/refresh-all-emails")
-async def refresh_all_antigravity_user_emails(token: str = Depends(verify_token)):
+async def refresh_all_antigravity_user_emails(token: str = Depends(verify_panel_token)):
     """刷新所有Antigravity凭证文件的用户邮箱地址"""
     try:
         return await refresh_all_user_emails_common(is_antigravity=True)
@@ -1756,7 +1688,7 @@ async def refresh_all_antigravity_user_emails(token: str = Depends(verify_token)
 
 
 @router.get("/antigravity/creds/download-all")
-async def download_all_antigravity_creds(token: str = Depends(verify_token)):
+async def download_all_antigravity_creds(token: str = Depends(verify_panel_token)):
     """
     打包下载所有Antigravity凭证文件（流式处理，按需加载每个凭证数据）
     只在实际下载时才加载完整凭证内容，最大化性能
@@ -1768,5 +1700,174 @@ async def download_all_antigravity_creds(token: str = Depends(verify_token)):
     except Exception as e:
         log.error(f"打包下载Antigravity凭证失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+async def verify_credential_project_common(filename: str, is_antigravity: bool = False) -> JSONResponse:
+    """验证并重新获取凭证的project id的通用函数"""
+
+    cred_type = "Antigravity" if is_antigravity else "GCLI"
+
+    # 验证文件名
+    if not filename.endswith(".json"):
+        raise HTTPException(status_code=400, detail="无效的文件名")
+
+    await ensure_credential_manager_initialized()
+    storage_adapter = await get_storage_adapter()
+
+    # 获取凭证数据
+    credential_data = await storage_adapter.get_credential(filename, is_antigravity=is_antigravity)
+    if not credential_data:
+        raise HTTPException(status_code=404, detail="凭证不存在")
+
+    # 创建凭证对象
+    credentials = Credentials.from_dict(credential_data)
+
+    # 确保token有效（自动刷新）
+    token_refreshed = await credentials.refresh_if_needed()
+
+    # 如果token被刷新了，更新存储
+    if token_refreshed:
+        log.info(f"Token已自动刷新: {filename} (is_antigravity={is_antigravity})")
+        credential_data = credentials.to_dict()
+        await storage_adapter.store_credential(filename, credential_data, is_antigravity=is_antigravity)
+
+    # 获取API端点和对应的User-Agent
+    if is_antigravity:
+        api_base_url = await get_antigravity_api_url()
+        user_agent = ANTIGRAVITY_USER_AGENT
+    else:
+        api_base_url = await get_code_assist_endpoint()
+        user_agent = STANDARD_USER_AGENT
+
+    # 重新获取project id
+    project_id = await fetch_project_id(
+        access_token=credentials.access_token,
+        user_agent=user_agent,
+        api_base_url=api_base_url
+    )
+
+    if project_id:
+        # 更新凭证数据中的project_id
+        credential_data["project_id"] = project_id
+        await storage_adapter.store_credential(filename, credential_data, is_antigravity=is_antigravity)
+
+        # 检验成功后自动解除禁用状态并清除错误码
+        await storage_adapter.update_credential_state(filename, {
+            "disabled": False,
+            "error_codes": []
+        }, is_antigravity=is_antigravity)
+
+        log.info(f"检验{cred_type}凭证成功: {filename} - Project ID: {project_id} - 已解除禁用并清除错误码")
+
+        return JSONResponse(content={
+            "success": True,
+            "filename": filename,
+            "project_id": project_id,
+            "message": "检验成功！Project ID已更新，已解除禁用状态并清除错误码，403错误应该已恢复"
+        })
+    else:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "success": False,
+                "filename": filename,
+                "message": "检验失败：无法获取Project ID，请检查凭证是否有效"
+            }
+        )
+
+
+@router.post("/creds/verify-project/{filename}")
+async def verify_credential_project(filename: str, token: str = Depends(verify_panel_token)):
+    """
+    检验GCLI凭证的project id，重新获取project id
+    检验成功可以使403错误恢复
+    """
+    try:
+        return await verify_credential_project_common(filename, is_antigravity=False)
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"检验凭证Project ID失败 {filename}: {e}")
+        raise HTTPException(status_code=500, detail=f"检验失败: {str(e)}")
+
+
+@router.post("/antigravity/creds/verify-project/{filename}")
+async def verify_antigravity_credential_project(filename: str, token: str = Depends(verify_panel_token)):
+    """
+    检验Antigravity凭证的project id，重新获取project id
+    检验成功可以使403错误恢复
+    """
+    try:
+        return await verify_credential_project_common(filename, is_antigravity=True)
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"检验Antigravity凭证Project ID失败 {filename}: {e}")
+        raise HTTPException(status_code=500, detail=f"检验失败: {str(e)}")
+
+
+@router.get("/antigravity/creds/quota/{filename}")
+async def get_antigravity_credential_quota(filename: str, token: str = Depends(verify_panel_token)):
+    """
+    获取指定Antigravity凭证的额度信息
+    """
+    try:
+        # 验证文件名
+        if not filename.endswith(".json"):
+            raise HTTPException(status_code=400, detail="无效的文件名")
+
+        await ensure_credential_manager_initialized()
+        storage_adapter = await get_storage_adapter()
+
+        # 获取凭证数据
+        credential_data = await storage_adapter.get_credential(filename, is_antigravity=True)
+        if not credential_data:
+            raise HTTPException(status_code=404, detail="凭证不存在")
+
+        # 使用 Credentials 对象自动处理 token 刷新
+        from .google_oauth_api import Credentials
+
+        creds = Credentials.from_dict(credential_data)
+
+        # 自动刷新 token（如果需要）
+        await creds.refresh_if_needed()
+
+        # 如果 token 被刷新了，更新存储
+        updated_data = creds.to_dict()
+        if updated_data != credential_data:
+            log.info(f"Token已自动刷新: {filename}")
+            await storage_adapter.store_credential(filename, updated_data, is_antigravity=True)
+            credential_data = updated_data
+
+        # 获取访问令牌
+        access_token = credential_data.get("access_token") or credential_data.get("token")
+        if not access_token:
+            raise HTTPException(status_code=400, detail="凭证中没有访问令牌")
+
+        # 获取额度信息
+        quota_info = await fetch_quota_info(access_token)
+
+        if quota_info.get("success"):
+            return JSONResponse(content={
+                "success": True,
+                "filename": filename,
+                "models": quota_info.get("models", {})
+            })
+        else:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "success": False,
+                    "filename": filename,
+                    "error": quota_info.get("error", "未知错误")
+                }
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"获取Antigravity凭证额度失败 {filename}: {e}")
+        raise HTTPException(status_code=500, detail=f"获取额度失败: {str(e)}")
+
 
 
