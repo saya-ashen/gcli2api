@@ -17,7 +17,7 @@ from config import (
 )
 from log import log
 
-from src.credential_manager import CredentialManager
+from src.credential_manager import credential_manager
 from src.httpx_client import stream_post_async, post_async
 from src.models import Model, model_to_dict
 from src.utils import ANTIGRAVITY_USER_AGENT
@@ -34,22 +34,7 @@ from src.api.utils import (
 
 # ==================== 全局凭证管理器 ====================
 
-# 全局凭证管理器实例（单例模式）
-_credential_manager: Optional[CredentialManager] = None
-
-
-async def _get_credential_manager() -> CredentialManager:
-    """
-    获取全局凭证管理器实例
-    
-    Returns:
-        CredentialManager实例
-    """
-    global _credential_manager
-    if not _credential_manager:
-        _credential_manager = CredentialManager()
-        await _credential_manager.initialize()
-    return _credential_manager
+# 使用全局单例 credential_manager，自动初始化
 
 
 # ==================== 辅助函数 ====================
@@ -75,8 +60,13 @@ def build_antigravity_headers(access_token: str, model_name: str = "") -> Dict[s
 
     # 根据模型名称判断 request_type
     if model_name:
-        request_type = "image_gen" if "image" in model_name.lower() else "agent"
-        headers['requestType'] = request_type
+        # 先判断是否是图片模型
+        if "image" in model_name.lower():
+            request_type = "image_gen"
+            headers['requestType'] = request_type
+        else:
+            request_type = "agent"
+            headers['requestType'] = request_type
 
     return headers
 
@@ -99,9 +89,6 @@ async def stream_request(
     Yields:
         Response对象（错误时）或 bytes流/str流（成功时）
     """
-    # 获取凭证管理器
-    credential_manager = await _get_credential_manager()
-
     model_name = body.get("model", "")
 
     # 1. 获取有效凭证
@@ -121,6 +108,7 @@ async def stream_request(
 
     current_file, credential_data = cred_result
     access_token = credential_data.get("access_token") or credential_data.get("token")
+    project_id = credential_data.get("project_id", "")
 
     if not access_token:
         log.error(f"[ANTIGRAVITY STREAM] No access token in credential: {current_file}")
@@ -141,6 +129,13 @@ async def stream_request(
     if headers:
         auth_headers.update(headers)
 
+    # 构建包含project的payload
+    final_payload = {
+        "model": body.get("model"),
+        "project": project_id,
+        "request": body.get("request", {}),
+    }
+
     # 3. 调用stream_post_async进行请求
     retry_config = await get_retry_config()
     max_retries = retry_config["max_retries"]
@@ -151,7 +146,7 @@ async def stream_request(
     
     # 内部函数：获取新凭证并更新headers
     async def refresh_credential():
-        nonlocal current_file, access_token, auth_headers
+        nonlocal current_file, access_token, auth_headers, project_id, final_payload
         cred_result = await credential_manager.get_valid_credential(
             mode="antigravity", model_key=model_name
         )
@@ -159,11 +154,13 @@ async def stream_request(
             return None
         current_file, credential_data = cred_result
         access_token = credential_data.get("access_token") or credential_data.get("token")
+        project_id = credential_data.get("project_id", "")
         if not access_token:
             return None
         auth_headers = build_antigravity_headers(access_token, model_name)
         if headers:
             auth_headers.update(headers)
+        final_payload = {"model": body.get("model"), "project": project_id, "request": body.get("request", {})}
         return True
 
     for attempt in range(max_retries + 1):
@@ -173,7 +170,7 @@ async def stream_request(
         try:
             async for chunk in stream_post_async(
                 url=target_url,
-                body=body,
+                body=final_payload,
                 native=native,
                 headers=auth_headers
             ):
@@ -182,8 +179,8 @@ async def stream_request(
                     status_code = chunk.status_code
                     last_error_response = chunk  # 记录最后一次错误
 
-                    # 如果错误码是429或者不在禁用码当中，做好记录后进行重试
-                    if status_code == 429 or status_code not in DISABLE_ERROR_CODES:
+                    # 如果错误码是429或者在禁用码当中，做好记录后进行重试
+                    if status_code == 429 or status_code in DISABLE_ERROR_CODES:
                         # 解析错误响应内容
                         try:
                             error_body = chunk.body.decode('utf-8') if isinstance(chunk.body, bytes) else str(chunk.body)
@@ -222,12 +219,12 @@ async def stream_request(
                             yield chunk
                             return
                     else:
-                        # 错误码在禁用码当中，直接返回，无需重试
+                        # 错误码不在禁用码当中，直接返回，无需重试
                         try:
                             error_body = chunk.body.decode('utf-8') if isinstance(chunk.body, bytes) else str(chunk.body)
-                            log.error(f"[ANTIGRAVITY STREAM] 流式请求失败，禁用错误码 (status={status_code}), 凭证: {current_file}, 响应: {error_body[:500]}")
+                            log.error(f"[ANTIGRAVITY STREAM] 流式请求失败，非重试错误码 (status={status_code}), 凭证: {current_file}, 响应: {error_body[:500]}")
                         except Exception:
-                            log.error(f"[ANTIGRAVITY STREAM] 流式请求失败，禁用错误码 (status={status_code}), 凭证: {current_file}")
+                            log.error(f"[ANTIGRAVITY STREAM] 流式请求失败，非重试错误码 (status={status_code}), 凭证: {current_file}")
                         await record_api_call_error(
                             credential_manager, current_file, status_code,
                             None, mode="antigravity", model_key=model_name
@@ -242,7 +239,7 @@ async def stream_request(
                             credential_manager, current_file, mode="antigravity", model_key=model_name
                         )
                         success_recorded = True
-                        log.info(f"[ANTIGRAVITY STREAM] 开始接收流式响应，模型: {model_name}")
+                        log.debug(f"[ANTIGRAVITY STREAM] 开始接收流式响应，模型: {model_name}")
 
                     # 记录原始chunk内容（用于调试）
                     if isinstance(chunk, bytes):
@@ -254,7 +251,7 @@ async def stream_request(
 
             # 流式请求完成，检查结果
             if success_recorded:
-                log.info(f"[ANTIGRAVITY STREAM] 流式响应完成，模型: {model_name}")
+                log.debug(f"[ANTIGRAVITY STREAM] 流式响应完成，模型: {model_name}")
                 return
             elif not need_retry:
                 # 没有收到任何数据（空回复），需要重试
@@ -318,7 +315,7 @@ async def non_stream_request(
     """
     # 检查是否启用流式收集模式
     if await get_antigravity_stream2nostream():
-        log.info("[ANTIGRAVITY] 使用流式收集模式实现非流式请求")
+        log.debug("[ANTIGRAVITY] 使用流式收集模式实现非流式请求")
 
         # 调用stream_request获取流
         stream = stream_request(body=body, native=False, headers=headers)
@@ -329,10 +326,7 @@ async def non_stream_request(
         return await collect_streaming_response(stream)
 
     # 否则使用传统非流式模式
-    log.info("[ANTIGRAVITY] 使用传统非流式模式")
-
-    # 获取凭证管理器
-    credential_manager = await _get_credential_manager()
+    log.debug("[ANTIGRAVITY] 使用传统非流式模式")
 
     model_name = body.get("model", "")
 
@@ -352,6 +346,7 @@ async def non_stream_request(
 
     current_file, credential_data = cred_result
     access_token = credential_data.get("access_token") or credential_data.get("token")
+    project_id = credential_data.get("project_id", "")
 
     if not access_token:
         log.error(f"[ANTIGRAVITY] No access token in credential: {current_file}")
@@ -371,6 +366,13 @@ async def non_stream_request(
     if headers:
         auth_headers.update(headers)
 
+    # 构建包含project的payload
+    final_payload = {
+        "model": body.get("model"),
+        "project": project_id,
+        "request": body.get("request", {}),
+    }
+
     # 3. 调用post_async进行请求
     retry_config = await get_retry_config()
     max_retries = retry_config["max_retries"]
@@ -381,7 +383,7 @@ async def non_stream_request(
     
     # 内部函数：获取新凭证并更新headers
     async def refresh_credential():
-        nonlocal current_file, access_token, auth_headers
+        nonlocal current_file, access_token, auth_headers, project_id, final_payload
         cred_result = await credential_manager.get_valid_credential(
             mode="antigravity", model_key=model_name
         )
@@ -389,11 +391,13 @@ async def non_stream_request(
             return None
         current_file, credential_data = cred_result
         access_token = credential_data.get("access_token") or credential_data.get("token")
+        project_id = credential_data.get("project_id", "")
         if not access_token:
             return None
         auth_headers = build_antigravity_headers(access_token, model_name)
         if headers:
             auth_headers.update(headers)
+        final_payload = {"model": body.get("model"), "project": project_id, "request": body.get("request", {})}
         return True
 
     for attempt in range(max_retries + 1):
@@ -402,7 +406,7 @@ async def non_stream_request(
         try:
             response = await post_async(
                 url=target_url,
-                json=body,
+                json=final_payload,
                 headers=auth_headers,
                 timeout=300.0
             )
@@ -450,7 +454,7 @@ async def non_stream_request(
                 )
 
                 # 判断是否需要重试
-                if status_code == 429 or status_code not in DISABLE_ERROR_CODES:
+                if status_code == 429 or status_code in DISABLE_ERROR_CODES:
                     try:
                         error_text = response.text
                         log.warning(f"[ANTIGRAVITY] 非流式请求失败 (status={status_code}), 凭证: {current_file}, 响应: {error_text[:500]}")
@@ -486,12 +490,12 @@ async def non_stream_request(
                         log.error(f"[ANTIGRAVITY] 达到最大重试次数或不应重试，返回原始错误")
                         return last_error_response
                 else:
-                    # 错误码在禁用码当中，直接返回，无需重试
+                    # 错误码不在禁用码当中，直接返回，无需重试
                     try:
                         error_text = response.text
-                        log.error(f"[ANTIGRAVITY] 非流式请求失败，禁用错误码 (status={status_code}), 凭证: {current_file}, 响应: {error_text[:500]}")
+                        log.error(f"[ANTIGRAVITY] 非流式请求失败，非重试错误码 (status={status_code}), 凭证: {current_file}, 响应: {error_text[:500]}")
                     except Exception:
-                        log.error(f"[ANTIGRAVITY] 非流式请求失败，禁用错误码 (status={status_code}), 凭证: {current_file}")
+                        log.error(f"[ANTIGRAVITY] 非流式请求失败，非重试错误码 (status={status_code}), 凭证: {current_file}")
                     await record_api_call_error(
                         credential_manager, current_file, status_code,
                         None, mode="antigravity", model_key=model_name
@@ -541,7 +545,6 @@ async def fetch_available_models() -> List[Dict[str, Any]]:
         返回空列表如果获取失败
     """
     # 获取凭证管理器和可用凭证
-    credential_manager = await _get_credential_manager()
     cred_result = await credential_manager.get_valid_credential(mode="antigravity")
     if not cred_result:
         log.error("[ANTIGRAVITY] No valid credentials available for fetching models")

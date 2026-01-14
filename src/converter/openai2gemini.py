@@ -66,7 +66,9 @@ def _map_finish_reason(gemini_reason: str) -> str:
     elif gemini_reason in ["SAFETY", "RECITATION"]:
         return "content_filter"
     else:
-        return None
+        # 对于 None 或未知的 finishReason，返回 "stop" 作为默认值
+        # 避免返回 None 导致 MCP 客户端误判为响应未完成而循环调用
+        return "stop"
 
 
 # ==================== Tool Conversion Functions ====================
@@ -78,15 +80,14 @@ def _normalize_function_name(name: str) -> str:
 
     规则：
     - 必须以字母或下划线开头
-    - 只能包含 a-z, A-Z, 0-9, 下划线, 点, 短横线
+    - 只能包含 a-z, A-Z, 0-9, 下划线, 英文句点, 英文短划线
     - 最大长度 64 个字符
 
     转换策略：
-    - 中文字符转换为拼音
-    - 如果以非字母/下划线开头，添加 "_" 前缀
-    - 将非法字符（空格、@、#等）替换为下划线
-    - 连续的下划线合并为一个
-    - 如果超过 64 个字符，截断
+    1. 中文字符转换为拼音
+    2. 将非法字符替换为下划线
+    3. 如果以非字母/下划线开头，添加下划线前缀
+    4. 截断到 64 个字符
 
     Args:
         name: 原始函数名
@@ -99,20 +100,16 @@ def _normalize_function_name(name: str) -> str:
     if not name:
         return "_unnamed_function"
 
-    # 第零步：检测并转换中文字符为拼音
-    # 检查是否包含中文字符
+    # 步骤1：转换中文字符为拼音
     if re.search(r"[\u4e00-\u9fff]", name):
         try:
-
-            # 将中文转换为拼音，用下划线连接多音字
             parts = []
             for char in name:
                 if "\u4e00" <= char <= "\u9fff":
-                    # 中文字符，转换为拼音
+                    # 中文字符转换为拼音
                     pinyin = lazy_pinyin(char, style=Style.NORMAL)
                     parts.append("".join(pinyin))
                 else:
-                    # 非中文字符，保持不变
                     parts.append(char)
             normalized = "".join(parts)
         except ImportError:
@@ -121,40 +118,22 @@ def _normalize_function_name(name: str) -> str:
     else:
         normalized = name
 
-    # 第一步：将非法字符替换为下划线
-    # 保留：a-z, A-Z, 0-9, 下划线, 点, 短横线
+    # 步骤2：将非法字符替换为下划线
+    # 合法字符：a-z, A-Z, 0-9, _, ., -
     normalized = re.sub(r"[^a-zA-Z0-9_.\-]", "_", normalized)
 
-    # 第二步：如果以非字母/下划线开头，处理首字符
-    prefix_added = False
+    # 步骤3：确保以字母或下划线开头
     if normalized and not (normalized[0].isalpha() or normalized[0] == "_"):
-        if normalized[0] in ".-":
-            # 点和短横线在开头位置替换为下划线（它们在中间是合法的）
-            normalized = "_" + normalized[1:]
-        else:
-            # 其他字符（如数字）添加下划线前缀
-            normalized = "_" + normalized
-        prefix_added = True
+        # 以数字、点或短横线开头，添加下划线前缀
+        normalized = "_" + normalized
 
-    # 第三步：合并连续的下划线
-    normalized = re.sub(r"_+", "_", normalized)
-
-    # 第四步：移除首尾的下划线
-    # 如果原本就是下划线开头，或者我们添加了前缀，则保留开头的下划线
-    if name.startswith("_") or prefix_added:
-        # 只移除尾部的下划线
-        normalized = normalized.rstrip("_")
-    else:
-        # 移除首尾的下划线
-        normalized = normalized.strip("_")
-
-    # 第五步：确保不为空
-    if not normalized:
-        normalized = "_unnamed_function"
-
-    # 第六步：截断到 64 个字符
+    # 步骤4：截断到 64 个字符
     if len(normalized) > 64:
         normalized = normalized[:64]
+
+    # 步骤5：确保不为空
+    if not normalized:
+        normalized = "_unnamed_function"
 
     return normalized
 
@@ -185,12 +164,161 @@ def _resolve_ref(ref: str, root_schema: Dict[str, Any]) -> Optional[Dict[str, An
     return current if isinstance(current, dict) else None
 
 
+def _clean_schema_for_claude(schema: Any, root_schema: Optional[Dict[str, Any]] = None, visited: Optional[set] = None) -> Any:
+    """
+    清理 JSON Schema，转换为 Claude API 支持的格式（符合 JSON Schema draft 2020-12）
+
+    处理逻辑：
+    1. 解析 $ref 引用
+    2. 合并 allOf 中的 schema
+    3. 转换 anyOf 为更兼容的格式
+    4. 保持标准 JSON Schema 类型（不转换为大写）
+    5. 处理 array 的 items
+    6. 清理 Claude 不支持的字段
+
+    Args:
+        schema: JSON Schema 对象
+        root_schema: 根 schema（用于解析 $ref）
+        visited: 已访问的对象集合（防止循环引用）
+
+    Returns:
+        清理后的 schema
+    """
+    # 非字典类型直接返回
+    if not isinstance(schema, dict):
+        return schema
+
+    # 初始化
+    if root_schema is None:
+        root_schema = schema
+    if visited is None:
+        visited = set()
+
+    # 防止循环引用
+    schema_id = id(schema)
+    if schema_id in visited:
+        return schema
+    visited.add(schema_id)
+
+    # 创建副本避免修改原对象
+    result = {}
+
+    # 1. 处理 $ref
+    if "$ref" in schema:
+        resolved = _resolve_ref(schema["$ref"], root_schema)
+        if resolved:
+            import copy
+            result = copy.deepcopy(resolved)
+            for key, value in schema.items():
+                if key != "$ref":
+                    result[key] = value
+            schema = result
+            result = {}
+
+    # 2. 处理 allOf（合并所有 schema）
+    if "allOf" in schema:
+        all_of_schemas = schema["allOf"]
+        for item in all_of_schemas:
+            cleaned_item = _clean_schema_for_claude(item, root_schema, visited)
+
+            if "properties" in cleaned_item:
+                if "properties" not in result:
+                    result["properties"] = {}
+                result["properties"].update(cleaned_item["properties"])
+
+            if "required" in cleaned_item:
+                if "required" not in result:
+                    result["required"] = []
+                result["required"].extend(cleaned_item["required"])
+
+            for key, value in cleaned_item.items():
+                if key not in ["properties", "required"]:
+                    result[key] = value
+
+        for key, value in schema.items():
+            if key not in ["allOf", "properties", "required"]:
+                result[key] = value
+            elif key in ["properties", "required"] and key not in result:
+                result[key] = value
+    else:
+        result = dict(schema)
+
+    # 3. 处理 type 数组（如 ["string", "null"]）
+    if "type" in result:
+        type_value = result["type"]
+        if isinstance(type_value, list):
+            # Claude 支持 type 数组，保持不变
+            pass
+
+    # 4. 处理 array 的 items
+    if result.get("type") == "array":
+        if "items" not in result:
+            result["items"] = {}
+        elif isinstance(result["items"], list):
+            # Tuple 定义，检查是否所有元素类型相同
+            tuple_items = result["items"]
+            first_type = tuple_items[0].get("type") if tuple_items else None
+            is_homogeneous = all(item.get("type") == first_type for item in tuple_items)
+
+            if is_homogeneous and first_type:
+                result["items"] = _clean_schema_for_claude(tuple_items[0], root_schema, visited)
+            else:
+                # 异质元组，使用 anyOf 表示
+                result["items"] = {
+                    "anyOf": [_clean_schema_for_claude(item, root_schema, visited) for item in tuple_items]
+                }
+        else:
+            result["items"] = _clean_schema_for_claude(result["items"], root_schema, visited)
+
+    # 5. 处理 anyOf（保持 anyOf，递归清理）
+    if "anyOf" in result:
+        result["anyOf"] = [_clean_schema_for_claude(item, root_schema, visited) for item in result["anyOf"]]
+
+    # 6. 清理 Claude 不支持的字段（根据 JSON Schema 2020-12）
+    # Claude API 对某些字段比较严格，移除可能导致问题的字段
+    unsupported_keys = {
+        "title", "$schema", "strict",
+        "additionalItems",  # 废弃字段，使用 items 替代
+        "exclusiveMaximum", "exclusiveMinimum",  # 在 2020-12 中这些应该是数值而非布尔值
+        "$defs", "definitions",  # 移除 definitions 相关字段避免冲突
+        "example", "examples", "readOnly", "writeOnly",
+        "const",  # const 可能导致问题
+        "contentEncoding", "contentMediaType",
+        "oneOf",  # oneOf 可能导致问题，用 anyOf 替代
+    }
+
+    for key in list(result.keys()):
+        if key in unsupported_keys:
+            del result[key]
+
+    # 递归处理 additionalProperties（如果存在）
+    if "additionalProperties" in result and isinstance(result["additionalProperties"], dict):
+        result["additionalProperties"] = _clean_schema_for_claude(result["additionalProperties"], root_schema, visited)
+
+    # 7. 递归处理 properties
+    if "properties" in result:
+        cleaned_props = {}
+        for prop_name, prop_schema in result["properties"].items():
+            cleaned_props[prop_name] = _clean_schema_for_claude(prop_schema, root_schema, visited)
+        result["properties"] = cleaned_props
+
+    # 8. 确保有 type 字段（如果有 properties 但没有 type）
+    if "properties" in result and "type" not in result:
+        result["type"] = "object"
+
+    # 9. 去重 required 数组
+    if "required" in result and isinstance(result["required"], list):
+        result["required"] = list(dict.fromkeys(result["required"]))
+
+    return result
+
+
 def _clean_schema_for_gemini(schema: Any, root_schema: Optional[Dict[str, Any]] = None, visited: Optional[set] = None) -> Any:
     """
     清理 JSON Schema，转换为 Gemini 支持的格式
-    
+
     参考 worker.mjs 的 transformOpenApiSchemaToGemini 实现
-    
+
     处理逻辑：
     1. 解析 $ref 引用
     2. 合并 allOf 中的 schema
@@ -199,12 +327,12 @@ def _clean_schema_for_gemini(schema: Any, root_schema: Optional[Dict[str, Any]] 
     5. 处理 ARRAY 的 items（包括 Tuple）
     6. 将 default 值移到 description
     7. 清理不支持的字段
-    
+
     Args:
         schema: JSON Schema 对象
         root_schema: 根 schema（用于解析 $ref）
         visited: 已访问的对象集合（防止循环引用）
-        
+
     Returns:
         清理后的 schema
     """
@@ -470,18 +598,22 @@ def fix_tool_call_args_types(
     return fixed_args
 
 
-def convert_openai_tools_to_gemini(openai_tools: List) -> List[Dict[str, Any]]:
+def convert_openai_tools_to_gemini(openai_tools: List, model: str = "") -> List[Dict[str, Any]]:
     """
     将 OpenAI tools 格式转换为 Gemini functionDeclarations 格式
 
     Args:
         openai_tools: OpenAI 格式的工具列表（可能是字典或 Pydantic 模型）
+        model: 模型名称（用于判断是否为 Claude 模型）
 
     Returns:
         Gemini 格式的工具列表
     """
     if not openai_tools:
         return []
+
+    # 判断是否为 Claude 模型
+    is_claude_model = "claude" in model.lower()
 
     function_declarations = []
 
@@ -513,9 +645,14 @@ def convert_openai_tools_to_gemini(openai_tools: List) -> List[Dict[str, Any]]:
             "description": function.get("description", ""),
         }
 
-        # 添加参数（如果有）- 清理不支持的 schema 字段
+        # 添加参数（如果有）- 根据模型选择不同的清理函数
         if "parameters" in function:
-            cleaned_params = _clean_schema_for_gemini(function["parameters"])
+            if is_claude_model:
+                cleaned_params = _clean_schema_for_claude(function["parameters"])
+                log.debug(f"[OPENAI2GEMINI] Using Claude schema cleaning for tool: {normalized_name}")
+            else:
+                cleaned_params = _clean_schema_for_gemini(function["parameters"])
+
             if cleaned_params:
                 declaration["parameters"] = cleaned_params
 
@@ -606,6 +743,10 @@ def convert_tool_message_to_function_response(message, all_messages: List = None
     except (json.JSONDecodeError, TypeError):
         # 如果不是有效的 JSON，包装为对象
         response_data = {"result": str(message.content)}
+
+    # 确保 response_data 是字典类型（Gemini API 要求 response 必须是对象）
+    if not isinstance(response_data, dict):
+        response_data = {"result": response_data}
 
     return {"functionResponse": {"id": original_tool_call_id, "name": name, "response": response_data}}
 
@@ -797,6 +938,18 @@ async def convert_openai_to_gemini_request(openai_request: Dict[str, Any]) -> Di
     # 提取消息列表
     messages = openai_request.get("messages", [])
     
+    # 构建 tool_call_id -> (name, original_id, signature) 的映射
+    tool_call_mapping = {}
+    for msg in messages:
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            for tc in msg["tool_calls"]:
+                encoded_id = tc.get("id", "")
+                func_name = tc.get("function", {}).get("name") or ""
+                if encoded_id:
+                    # 解码获取原始ID和签名
+                    original_id, signature = decode_tool_id_and_signature(encoded_id)
+                    tool_call_mapping[encoded_id] = (func_name, original_id, signature)
+    
     # 构建工具名称到参数 schema 的映射（用于类型修正）
     tool_schemas = {}
     if "tools" in openai_request and openai_request["tools"]:
@@ -816,19 +969,28 @@ async def convert_openai_to_gemini_request(openai_request: Dict[str, Any]) -> Di
             tool_call_id = message.get("tool_call_id", "")
             func_name = message.get("name")
 
-            # 如果没有name,尝试从消息列表中查找
-            if not func_name and tool_call_id:
-                for msg in messages:
-                    if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                        for tc in msg["tool_calls"]:
-                            if tc.get("id") == tool_call_id:
-                                func_name = tc.get("function", {}).get("name")
+            # 使用映射表查找
+            if tool_call_id in tool_call_mapping:
+                func_name, original_id, _ = tool_call_mapping[tool_call_id]
+            else:
+                # 如果没有name,尝试从消息列表中查找
+                if not func_name and tool_call_id:
+                    for msg in messages:
+                        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                            for tc in msg["tool_calls"]:
+                                if tc.get("id") == tool_call_id:
+                                    func_name = tc.get("function", {}).get("name")
+                                    break
+                            if func_name:
                                 break
-                        if func_name:
-                            break
 
+                # 解码 tool_call_id 获取原始 ID
+                original_id, _ = decode_tool_id_and_signature(tool_call_id)
+
+            # 最终兜底：确保 func_name 不为空
             if not func_name:
                 func_name = "unknown_function"
+                log.warning(f"Tool message missing function name for tool_call_id={tool_call_id}, using default: {func_name}")
 
             # 解析响应数据
             try:
@@ -836,11 +998,16 @@ async def convert_openai_to_gemini_request(openai_request: Dict[str, Any]) -> Di
             except (json.JSONDecodeError, TypeError):
                 response_data = {"result": str(content)}
 
+            # 确保 response_data 是字典类型（Gemini API 要求 response 必须是对象）
+            if not isinstance(response_data, dict):
+                response_data = {"result": response_data}
+
+            # 使用原始 ID（不带签名）
             contents.append({
                 "role": "user",
                 "parts": [{
                     "functionResponse": {
-                        "id": tool_call_id,
+                        "id": original_id,
                         "name": func_name,
                         "response": response_data
                     }
@@ -991,9 +1158,10 @@ async def convert_openai_to_gemini_request(openai_request: Dict[str, Any]) -> Di
     if "systemInstruction" in openai_request:
         gemini_request["systemInstruction"] = openai_request["systemInstruction"]
 
-    # 处理工具
+    # 处理工具 - 传递 model 参数以便根据模型类型选择清理策略
+    model = openai_request.get("model", "")
     if "tools" in openai_request and openai_request["tools"]:
-        gemini_request["tools"] = convert_openai_tools_to_gemini(openai_request["tools"])
+        gemini_request["tools"] = convert_openai_tools_to_gemini(openai_request["tools"], model)
 
     # 处理tool_choice
     if "tool_choice" in openai_request and openai_request["tool_choice"]:
@@ -1130,14 +1298,22 @@ def convert_gemini_to_openai_response(
         # 构建消息对象
         message = {"role": role}
 
+        # 获取 Gemini 的 finishReason
+        gemini_finish_reason = candidate.get("finishReason")
+        
         # 如果有工具调用
         if tool_calls:
             message["tool_calls"] = tool_calls
             message["content"] = text_content if text_content else None
-            finish_reason = "tool_calls"
+            # 只有在正常停止（STOP）时才设为 tool_calls，其他情况保持原始 finish_reason
+            # 这样可以避免在 SAFETY、MAX_TOKENS 等情况下仍然返回 tool_calls 导致循环
+            if gemini_finish_reason == "STOP":
+                finish_reason = "tool_calls"
+            else:
+                finish_reason = _map_finish_reason(gemini_finish_reason)
         else:
             message["content"] = text_content
-            finish_reason = _map_finish_reason(candidate.get("finishReason"))
+            finish_reason = _map_finish_reason(gemini_finish_reason)
 
         # 添加 reasoning content (如果有)
         if reasoning_content:
@@ -1300,8 +1476,13 @@ def convert_gemini_to_openai_stream(
         if reasoning_content:
             delta["reasoning_content"] = reasoning_content
 
-        finish_reason = _map_finish_reason(candidate.get("finishReason"))
-        if finish_reason and tool_calls:
+        # 获取 Gemini 的 finishReason
+        gemini_finish_reason = candidate.get("finishReason")
+        finish_reason = _map_finish_reason(gemini_finish_reason)
+        
+        # 只有在正常停止（STOP）且有工具调用时才设为 tool_calls
+        # 避免在 SAFETY、MAX_TOKENS 等情况下仍然返回 tool_calls 导致循环
+        if tool_calls and gemini_finish_reason == "STOP":
             finish_reason = "tool_calls"
 
         choices.append({
